@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "gpui-fundamentals": {
+      "source": "cnwzhu/gpui-skills",
+      "sourceType": "github",
+      "skillPath": "gpui-fundamentals/SKILL.md",
+      "computedHash": "e81bda79a8bbb2d78d55a5c07498c0d59a1c73b5f12f232a69e7083a7ee9927d"
+    },
+    "rust-best-practices": {
+      "source": "stolinski/s-stack",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "3f89cd417842ca60bffefea01ee88fc28116b75a8e69329c4d6db446fbfcad02"
+    }
+  }
+}

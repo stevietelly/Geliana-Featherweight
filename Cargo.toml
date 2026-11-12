@@ -2,6 +2,11 @@
 name = "GelianaFeatherweight"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Stephen Telian", "Geliana"]
+description = "A Resource Efficient Screen Capture for windows Designed to work in the background while you game."
+homepage = "https://geliana.com/featherweight"
+documentation = "https://featherweight.geliana.com"
 
 [dependencies]
 chrono = "0.4.45"

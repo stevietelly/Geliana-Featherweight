@@ -24,6 +24,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW, HBITMAP,
@@ -31,7 +32,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, HICON,
-    ICONINFO,
+    ICONINFO, IsIconic,
 };
 use windows_capture::{
     capture::{Context, GraphicsCaptureApiHandler},
@@ -61,23 +62,38 @@ use crate::{
 
 struct WgcFlags {
     output: PathBuf,
-    width: u32,
-    height: u32,
     fps: u32,
     bitrate: u32,
     stop: Arc<AtomicBool>,
     audio: Option<AudioPipeline>,
     mic_pcm_path: Option<PathBuf>,
     finalization_error: Arc<Mutex<Option<String>>>,
+    /// Set once the first WGC frame has sized and created the encoder. The
+    /// recorder polls it to move the session out of `WaitingForFirstFrame`,
+    /// and the audio sinks gate on it so every track shares the video's
+    /// origin (see the sink closures in [`WgcCapture::new`]).
+    first_frame: Arc<AtomicBool>,
 }
 
 struct WgcCapture {
+    /// Created lazily on the first frame — its even-rounded resolution is
+    /// that frame's, never a value measured before capture started. `None`
+    /// until then; taken and finalized in [`Drop for WgcCapture`].
     encoder: Arc<Mutex<Option<VideoEncoder>>>,
+    /// Even-rounded (target) output dimensions, fixed by the first frame.
+    target: Option<(u32, u32)>,
+    fps: u32,
+    bitrate: u32,
+    output: PathBuf,
+    audio_enabled: bool,
+    first_frame: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     audio: Option<AudioPipeline>,
     finalization_error: Arc<Mutex<Option<String>>>,
     frame_interval: Duration,
     last_frame: Option<Instant>,
+    /// Logs the first size mismatch once per recording, not per frame.
+    letterbox_warned: bool,
 }
 
 impl GraphicsCaptureApiHandler for WgcCapture {
@@ -88,48 +104,76 @@ impl GraphicsCaptureApiHandler for WgcCapture {
         let audio_enabled = ctx.flags.audio.is_some();
         let frame_interval = Duration::from_secs_f64(1.0 / ctx.flags.fps.max(1) as f64);
         log::log(&format!(
-            "WGC: initializing encoder for {}x{} @ {}fps (audio_enabled={audio_enabled}) to {}",
-            ctx.flags.width,
-            ctx.flags.height,
+            "WGC: awaiting the first frame to size the encoder @ {}fps (audio_enabled={audio_enabled}) to {}",
             ctx.flags.fps,
             ctx.flags.output.display()
         ));
 
-        let encoder = VideoEncoder::new(
-            VideoSettingsBuilder::new(ctx.flags.width, ctx.flags.height)
-                .sub_type(VideoSettingsSubType::H264)
-                .bitrate(ctx.flags.bitrate)
-                .frame_rate(ctx.flags.fps),
-            AudioSettingsBuilder::new()
-                .disabled(!audio_enabled)
-                .sample_rate(SAMPLE_RATE)
-                .channel_count(CHANNELS)
-                .bit_per_sample(16),
-            ContainerSettingsBuilder::new(),
-            &ctx.flags.output,
-        )?;
-
-        let shared_encoder = Arc::new(Mutex::new(Some(encoder)));
+        let shared_encoder: Arc<Mutex<Option<VideoEncoder>>> = Arc::new(Mutex::new(None));
         let mut audio = ctx.flags.audio.take();
+        let video_started = ctx.flags.first_frame.clone();
+        // Separate clone for the mic sink: the primary closure below moves
+        // the first one.
+        let video_started_for_mic = video_started.clone();
 
         if let Some(ref mut audio_pipe) = audio {
             let enc = shared_encoder.clone();
             let primary_sink = move |data: &[u8]| {
-                enc.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_mut()
-                    .ok_or_else(|| "Encoder already finalized".to_string())?
-                    .send_audio_buffer(data, 0)
-                    .map_err(|e| e.to_string())
+                let mut guard = enc.lock().unwrap_or_else(|e| e.into_inner());
+                // A/V sync: the video origin (t=0 for every track) is the
+                // first video frame's SystemRelativeTime (WGC timestamps are
+                // QPC-derived 100 ns ticks). The encoder's audio path
+                // timestamps buffers with a monotonic sample counter that
+                // starts at its first buffer, so audio that arrives before
+                // the first frame is dropped here rather than written with a
+                // shifted offset — the counter then starts exactly at the
+                // video origin. (WASAPI packets are stamped internally on
+                // the same QPC clock, but the encoder ignores wall
+                // timestamps for audio, so the gate is what aligns the
+                // clocks.)
+                let Some(encoder) = guard.as_mut() else {
+                    if video_started.load(Ordering::Acquire) {
+                        return Err("Encoder already finalized".to_string());
+                    }
+                    return Ok(()); // still waiting for the first video frame
+                };
+                encoder.send_audio_buffer(data, 0).map_err(|e| e.to_string())
             };
 
             let secondary_sink: Option<Box<dyn FnMut(&[u8]) -> Result<(), String> + Send>> =
                 if let Some(ref mic_path) = ctx.flags.mic_pcm_path {
-                    let mut file = std::fs::File::create(mic_path)
-                        .map_err(|e| format!("Failed to create mic pcm file: {e}"))?;
+                    // The mic file is created on the first write after the
+                    // video origin, so a session cancelled while waiting
+                    // leaves no file behind.
+                    let video_started = video_started_for_mic;
+                    let file = Arc::new(Mutex::new(None::<std::fs::File>));
+                    let path = mic_path.clone();
+                    let mut create_failed = false;
                     Some(Box::new(move |data: &[u8]| {
+                        if !video_started.load(Ordering::Acquire) {
+                            return Ok(()); // dropped: before the A/V origin
+                        }
+                        let mut guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.is_none() {
+                            match std::fs::File::create(&path) {
+                                Ok(created) => *guard = Some(created),
+                                Err(e) => {
+                                    if !create_failed {
+                                        create_failed = true;
+                                        log::log(&format!(
+                                            "Failed to create mic pcm file {}: {e}; recording without the separate mic track",
+                                            path.display()
+                                        ));
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
                         use std::io::Write;
-                        file.write_all(data)
+                        guard
+                            .as_mut()
+                            .expect("file created above")
+                            .write_all(data)
                             .map_err(|e| format!("Mic write error: {e}"))
                     }))
                 } else {
@@ -145,11 +189,18 @@ impl GraphicsCaptureApiHandler for WgcCapture {
 
         Ok(Self {
             encoder: shared_encoder,
+            target: None,
+            fps: ctx.flags.fps.max(1),
+            bitrate: ctx.flags.bitrate,
+            output: ctx.flags.output,
+            audio_enabled,
+            first_frame: ctx.flags.first_frame,
             stop: ctx.flags.stop,
             audio,
             finalization_error: ctx.flags.finalization_error,
             frame_interval,
             last_frame: None,
+            letterbox_warned: false,
         })
     }
 
@@ -174,9 +225,87 @@ impl GraphicsCaptureApiHandler for WgcCapture {
         }
         self.last_frame = Some(now);
 
+        // The first frame decides the encoder resolution: WGC delivers the
+        // window's real content size, whatever GetWindowRect claimed at
+        // start (a minimized target reports its iconic rect, and a normal
+        // one includes the DWM shadow frame). Once created, the MP4's
+        // dimensions are fixed, and this frame's SystemRelativeTime (a
+        // QPC-derived 100 ns tick count) becomes t=0 for the video track —
+        // and, via the gated audio sinks, for every audio track.
+        if self.target.is_none() {
+            let width = even_dimension(frame.width());
+            let height = even_dimension(frame.height());
+            log::log(&format!(
+                "WGC: first frame is {}x{}; creating encoder at {width}x{height}",
+                frame.width(),
+                frame.height()
+            ));
+            match VideoEncoder::new(
+                VideoSettingsBuilder::new(width, height)
+                    .sub_type(VideoSettingsSubType::H264)
+                    .bitrate(self.bitrate)
+                    .frame_rate(self.fps),
+                AudioSettingsBuilder::new()
+                    .disabled(!self.audio_enabled)
+                    .sample_rate(SAMPLE_RATE)
+                    .channel_count(CHANNELS)
+                    .bit_per_sample(16),
+                ContainerSettingsBuilder::new(),
+                &self.output,
+            ) {
+                Ok(encoder) => {
+                    self.target = Some((width, height));
+                    *self.encoder.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoder);
+                    self.first_frame.store(true, Ordering::Release);
+                }
+                Err(e) => {
+                    let msg = format!("Failed to create the video encoder on the first frame: {e}");
+                    log::log(&msg);
+                    *self.finalization_error.lock().unwrap() = Some(msg);
+                    capture_control.stop();
+                    return Ok(());
+                }
+            }
+        }
+
+        let (target_width, target_height) = self.target.expect("encoder created above");
         let mut enc = self.encoder.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(encoder) = enc.as_mut() {
+        let Some(encoder) = enc.as_mut() else {
+            return Ok(()); // shutting down
+        };
+
+        if frame.width() == target_width && frame.height() == target_height {
             encoder.send_frame(frame)?;
+        } else {
+            // Fixed-resolution policy: letterbox, never crop. The library's
+            // own mismatch path clears to black and copies only the
+            // top-left block of the frame, which would show a cropped
+            // corner of the content, so the frame is scaled to fit and
+            // centered on black here instead. Transitional frames during a
+            // restore-from-minimized land here too. The first timestamp is
+            // already fixed inside the encoder, so passing the raw
+            // SystemRelativeTime keeps these frames in step with the
+            // send_frame path.
+            if !self.letterbox_warned {
+                self.letterbox_warned = true;
+                log::log(&format!(
+                    "WGC: frame size changed to {}x{}; letterboxing into the fixed {}x{} output for the rest of the recording",
+                    frame.width(),
+                    frame.height(),
+                    target_width,
+                    target_height
+                ));
+            }
+            let mut scratch = Vec::new();
+            let frame_width = frame.width();
+            let frame_height = frame.height();
+            let buffer = frame.buffer()?;
+            let source = buffer.as_nopadding_buffer(&mut scratch);
+            let letterboxed =
+                letterbox_bgra_bytes(source, frame_width, frame_height, target_width, target_height);
+            drop(buffer);
+            let timestamp = frame.timestamp()?.Duration;
+            encoder.send_frame_buffer(&letterboxed, timestamp)?;
         }
 
         Ok(())
@@ -199,6 +328,8 @@ impl Drop for WgcCapture {
             } else {
                 log::log("WGC: MP4 finalized cleanly with audio.");
             }
+        } else {
+            log::log("WGC: no video frame ever arrived; nothing was written to disk.");
         }
     }
 }
@@ -445,9 +576,18 @@ pub struct ActiveRecording {
     mic_pcm_path: Option<PathBuf>,
     worker: Option<thread::JoinHandle<()>>,
     finalization_error: Arc<Mutex<Option<String>>>,
+    /// Set once the pipeline's first video frame arrived. `false` means the
+    /// session never produced anything (a minimized target that was never
+    /// restored, for instance) and stopping it must leave no file behind.
+    first_frame: Arc<AtomicBool>,
 }
 
 impl ActiveRecording {
+    /// Whether the capture pipeline has delivered its first video frame.
+    pub fn first_frame_arrived(&self) -> bool {
+        self.first_frame.load(Ordering::Acquire)
+    }
+
     /// Stops the capture, finalizes the encoder, and (for separate-track
     /// recordings) muxes the mic track into the final file. Returns the final
     /// output path, or the finalization error.
@@ -462,6 +602,21 @@ impl ActiveRecording {
         let err = self.finalization_error.lock().unwrap().take();
         if let Some(e) = err {
             return Err(e);
+        }
+
+        // Cancelled before the first frame: the (deferred) encoder never
+        // created the video file and the gated audio sinks never created the
+        // mic file, so there is nothing to finalize or mux. Clean any stray
+        // staging files and report success — cancelling is not an error.
+        if !self.first_frame_arrived() {
+            log::log("ActiveRecording: stopped before the first frame; discarding the session with no output file.");
+            if let Some(temp) = &self.temp_video_path {
+                let _ = std::fs::remove_file(temp);
+            }
+            if let Some(mic) = &self.mic_pcm_path {
+                let _ = std::fs::remove_file(mic);
+            }
+            return Ok(self.output_path.clone());
         }
 
         if let (Some(temp_video), Some(mic_pcm)) =
@@ -500,6 +655,11 @@ impl ActiveRecording {
 
 /// Resolved capture source. `Monitor` carries everything the GDI fallback
 /// needs; `Window` has no GDI equivalent.
+///
+/// Neither variant carries a resolution: the encoder is sized from the first
+/// frame the pipeline actually delivers (see [`WgcCapture::on_frame_arrived`]),
+/// because pre-capture measurements lie — a minimized window reports its
+/// iconic rect and a normal one includes the DWM shadow frame.
 enum CaptureSource {
     Monitor {
         monitor: Monitor,
@@ -509,30 +669,16 @@ enum CaptureSource {
     },
     Window {
         window: Window,
-        width: u32,
-        height: u32,
     },
 }
 
+/// Rounds down to an even pixel count (H.264 requires even dimensions);
+/// clamps to at least 2.
+fn even_dimension(value: u32) -> u32 {
+    value.max(2) & !1
+}
+
 impl CaptureSource {
-    fn width(&self) -> u32 {
-        match self {
-            Self::Monitor { width, .. } | Self::Window { width, .. } => *width,
-        }
-    }
-
-    fn height(&self) -> u32 {
-        match self {
-            Self::Monitor { height, .. } | Self::Window { height, .. } => *height,
-        }
-    }
-
-    /// Rounds down to an even pixel count (H.264 requires even dimensions);
-    /// clamps to at least 2.
-    fn even(value: u32) -> u32 {
-        value.max(2) & !1
-    }
-
     /// Resolves the configured target into a concrete source. Returns `Err`
     /// for a window that has been closed or re-created since it was picked.
     fn resolve(config: &AppConfig) -> Result<Self, String> {
@@ -565,22 +711,15 @@ impl CaptureSource {
                         "The selected window \"{title}\" is no longer available. Pick a window again."
                     ));
                 }
-                let width = Self::even(
-                    window
-                        .width()
-                        .map_err(|e| format!("Could not get window width: {e}"))? as u32,
-                );
-                let height = Self::even(
-                    window
-                        .height()
-                        .map_err(|e| format!("Could not get window height: {e}"))? as u32,
-                );
-                log::log(&format!("Capture target: window \"{title}\" ({width}x{height})"));
-                Ok(Self::Window {
-                    window,
-                    width,
-                    height,
-                })
+                // IsIconic is informational only: a minimized target is
+                // perfectly valid — recording simply waits for it to deliver
+                // its first frame once restored.
+                let iconic = unsafe { IsIconic(HWND(*id as *mut std::ffi::c_void)) }.as_bool();
+                log::log(&format!(
+                    "Capture target: window \"{title}\"{}; the encoder will be sized from the first frame",
+                    if iconic { " (minimized: waiting for restore)" } else { "" }
+                ));
+                Ok(Self::Window { window })
             }
         }
     }
@@ -595,7 +734,14 @@ impl CaptureSource {
 /// `stop_signal` is the session stop flag: the pipeline polls it, and
 /// [`ActiveRecording::stop`] sets it before joining. `mic_muted` is the
 /// shared live-mute flag; the audio mixer polls it every mix tick so the
-/// tray's "Mute microphone" item silences the mic mid-session. Returns
+/// tray's "Mute microphone" item silences the mic mid-session.
+///
+/// The encoder's resolution is decided by the first frame the pipeline
+/// delivers (see [`WgcCapture::on_frame_arrived`]), never by measurements
+/// taken at start: a minimized window reports its iconic rect and a normal
+/// one includes the DWM shadow. Until that first frame — detectable via
+/// [`ActiveRecording::first_frame_arrived`] — nothing is written to disk and
+/// stopping the session cancels it cleanly with no output file. Returns
 /// `Err` if the target is invalid, the encoder cannot be created, or (for
 /// window targets) WGC cannot start — the GDI fallback only exists for
 /// monitor capture.
@@ -631,8 +777,6 @@ pub fn start_recording(
         };
 
     let source = CaptureSource::resolve(config)?;
-    let width = source.width();
-    let height = source.height();
 
     // If force_gdi is false, probe Windows Graphics Capture (WGC). For window
     // targets WGC is the only option, so force_gdi is ignored with a note.
@@ -659,6 +803,7 @@ pub fn start_recording(
         log::log("Windows Graphics Capture is available; starting WGC pipeline with audio...");
 
         let finalization_error = Arc::new(Mutex::new(None));
+        let first_frame = Arc::new(AtomicBool::new(false));
         let cursor = if config.show_cursor {
             CursorCaptureSettings::WithCursor
         } else {
@@ -672,14 +817,13 @@ pub fn start_recording(
             CaptureSource::Monitor { monitor, .. } => {
                 let flags = WgcFlags {
                     output: primary_output.clone(),
-                    width,
-                    height,
                     fps: config.fps.max(1),
                     bitrate: config.bitrate_mbps.max(1) * 1_000_000,
                     stop: stop_signal.clone(),
                     audio: start_audio_pipeline(config, &stop_signal, "WGC", mic_muted),
                     mic_pcm_path: mic_pcm_path.clone(),
                     finalization_error: finalization_error.clone(),
+                    first_frame: first_frame.clone(),
                 };
                 let settings = Settings::new(
                     *monitor,
@@ -693,17 +837,16 @@ pub fn start_recording(
                 );
                 WgcCapture::start_free_threaded(settings)
             }
-            CaptureSource::Window { window, .. } => {
+            CaptureSource::Window { window } => {
                 let flags = WgcFlags {
                     output: primary_output.clone(),
-                    width,
-                    height,
                     fps: config.fps.max(1),
                     bitrate: config.bitrate_mbps.max(1) * 1_000_000,
                     stop: stop_signal.clone(),
                     audio: start_audio_pipeline(config, &stop_signal, "WGC", mic_muted),
                     mic_pcm_path: mic_pcm_path.clone(),
                     finalization_error: finalization_error.clone(),
+                    first_frame: first_frame.clone(),
                 };
                 let settings = Settings::new(
                     *window,
@@ -746,6 +889,7 @@ pub fn start_recording(
                     mic_pcm_path,
                     worker: Some(worker),
                     finalization_error,
+                    first_frame,
                 });
             }
             Err(e) => {
@@ -929,6 +1073,8 @@ pub fn start_recording(
         mic_pcm_path,
         worker: Some(worker),
         finalization_error,
+        // Monitors always deliver frames; no waiting state exists here.
+        first_frame: Arc::new(AtomicBool::new(true)),
     })
 }
 
@@ -955,8 +1101,7 @@ fn start_audio_pipeline(
     stop_signal: &Arc<AtomicBool>,
     mode: &str,
     mic_muted: &Arc<AtomicBool>,
-) -> Option<AudioPipeline> {
-    match AudioPipeline::start(config.system_audio, config.microphone, stop_signal.clone()) {
+) -> Option<AudioPipeline> {    match AudioPipeline::start(config.system_audio, config.microphone, stop_signal.clone()) {
         Ok(Some(mut pipeline)) => {
             log::log(&format!(
                 "{mode}: WASAPI AudioPipeline started (system_loopback={}, mic={}).",
@@ -981,6 +1126,132 @@ fn start_audio_pipeline(
                 "{mode}: WASAPI AudioPipeline failed to start: {e}; recording video only"
             ));
             None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-resolution letterboxing
+// ---------------------------------------------------------------------------
+
+/// Computes the centered content rectangle that fits `src_w x src_h` inside
+/// `dst_w x dst_h` preserving aspect ratio. Returns `(x, y, w, h)` in
+/// destination pixels.
+fn letterbox_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, u32, u32) {
+    let scale = (dst_w as f64 / src_w as f64).min(dst_h as f64 / src_h as f64);
+    let w = ((src_w as f64 * scale).floor() as u32).max(1);
+    let h = ((src_h as f64 * scale).floor() as u32).max(1);
+    ((dst_w - w) / 2, (dst_h - h) / 2, w, h)
+}
+
+/// Scales `src` (tightly packed, top-down BGRA, `src_w x src_h`) to fit
+/// `dst_w x dst_h`, centers it on opaque black, and returns the result as a
+/// bottom-up BGRA buffer — the layout [`VideoEncoder::send_frame_buffer`]
+/// expects.
+///
+/// Runs only on frames whose size differs from the fixed encoder target
+/// (mid-recording resizes, transitional restore-from-minimized frames), so
+/// the per-pixel nearest-neighbour sampling cost is confined to those.
+fn letterbox_bgra_bytes(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for pixel in dst.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[0, 0, 0, 255]);
+    }
+    let (origin_x, origin_y, content_w, content_h) = letterbox_rect(src_w, src_h, dst_w, dst_h);
+    for row in 0..content_h {
+        let src_y = (row as u64 * src_h as u64 / content_h as u64) as usize;
+        // Output is bottom-up: a destination row counted from the top maps
+        // to the mirrored row index in the returned buffer.
+        let dst_row = (dst_h - 1 - (origin_y + row)) as usize;
+        for col in 0..content_w {
+            let src_x = (col as u64 * src_w as u64 / content_w as u64) as usize;
+            let s = (src_y * src_w as usize + src_x) * 4;
+            let d = (dst_row * dst_w as usize + (origin_x + col) as usize) * 4;
+            dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn even_dimensions_round_down_and_clamp() {
+        assert_eq!(even_dimension(1920), 1920);
+        assert_eq!(even_dimension(1081), 1080);
+        assert_eq!(even_dimension(1), 2);
+        assert_eq!(even_dimension(0), 2);
+    }
+
+    #[test]
+    fn matching_aspect_content_fills_target() {
+        assert_eq!(letterbox_rect(1920, 1080, 1280, 720), (0, 0, 1280, 720));
+    }
+
+    #[test]
+    fn wider_source_gets_side_bars() {
+        // 2:1 source into a 1:1 target: content is full height, centered.
+        assert_eq!(letterbox_rect(200, 100, 100, 100), (0, 25, 100, 50));
+    }
+
+    #[test]
+    fn taller_source_gets_top_bottom_bars() {
+        assert_eq!(letterbox_rect(100, 200, 100, 100), (25, 0, 50, 100));
+    }
+
+    #[test]
+    fn letterboxed_pixels_are_scaled_flipped_and_centered() {
+        // 2x2 source, four distinct colours, into a 4x2 target: scale = 1,
+        // content 2x2 centered at x=1 — one black bar left and right. The
+        // output is bottom-up, so the source's top row appears in the
+        // output's bottom row.
+        let src: Vec<u8> = [
+            220, 0, 0, 255, // top row, left: red
+            0, 220, 0, 255, // top row, right: green
+            0, 0, 220, 255, // bottom row, left: blue
+            220, 220, 0, 255, // bottom row, right: yellow
+        ]
+        .to_vec();
+        let dst = letterbox_bgra_bytes(&src, 2, 2, 4, 2);
+        let px = |x: usize, y_from_top: usize| {
+            let row = 1 - y_from_top;
+            &dst[(row * 4 + x) * 4..(row * 4 + x) * 4 + 4]
+        };
+        assert_eq!(px(0, 0), &[0, 0, 0, 255]);
+        assert_eq!(px(3, 0), &[0, 0, 0, 255]);
+        assert_eq!(px(0, 1), &[0, 0, 0, 255]);
+        assert_eq!(px(3, 1), &[0, 0, 0, 255]);
+        // Top image row (y_from_top=0) = source top row (red, green); the
+        // bottom-up output puts it in the buffer's last row.
+        assert_eq!(px(1, 0), &[220, 0, 0, 255]);
+        assert_eq!(px(2, 0), &[0, 220, 0, 255]);
+        // Bottom image row (y_from_top=1) = source bottom row (blue, yellow).
+        assert_eq!(px(1, 1), &[0, 0, 220, 255]);
+        assert_eq!(px(2, 1), &[220, 220, 0, 255]);
+    }
+
+    #[test]
+    fn letterbox_bars_are_opaque_black() {
+        // 1x1 red source into 4x2: scale = 2, content 2x2 centered at x=1.
+        let src = [255u8, 0, 0, 255];
+        let dst = letterbox_bgra_bytes(&src, 1, 1, 4, 2);
+        let px = |x: usize, y_from_top: usize| {
+            let row = 1 - y_from_top;
+            &dst[(row * 4 + x) * 4..(row * 4 + x) * 4 + 4]
+        };
+        for y in 0..2 {
+            assert_eq!(px(0, y), &[0, 0, 0, 255]);
+            assert_eq!(px(3, y), &[0, 0, 0, 255]);
+            assert_eq!(px(1, y), &[255, 0, 0, 255]);
+            assert_eq!(px(2, y), &[255, 0, 0, 255]);
         }
     }
 }

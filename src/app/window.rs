@@ -310,6 +310,35 @@ impl FeatherweightApp {
                     }
                 });
             }
+            SessionStatus::WaitingForFirstFrame { target } => {
+                ui.horizontal(|ui| {
+                    let frame = egui::Frame::new()
+                        .fill(Color32::from_rgb(60, 44, 0))
+                        .stroke(Stroke::new(1.0, AMBER))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(10, 6));
+                    frame.show(ui, |ui| {
+                        ui.label(RichText::new("◌").color(AMBER).size(14.0));
+                        ui.label(
+                            RichText::new(format!("Waiting for {target}…"))
+                                .monospace()
+                                .color(TEXT),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(
+                            "The window has not delivered a frame yet — is it minimized?",
+                        )
+                        .color(MUTED),
+                    );
+                    if ui
+                        .add_sized([110.0, CONTROL_HEIGHT], Button::new("Stop"))
+                        .clicked()
+                    {
+                        self.stop_recording();
+                    }
+                });
+            }
             SessionStatus::Idle => {
                 let simulated = std::env::var("FEATHERWEIGHT_SIMULATE")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

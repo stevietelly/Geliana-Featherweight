@@ -115,7 +115,10 @@ impl Tray {
             let status = shared.status.lock().unwrap();
             let config = shared.config.lock().unwrap();
             (
-                matches!(*status, SessionStatus::Recording { .. }),
+                matches!(
+                    *status,
+                    SessionStatus::Recording { .. } | SessionStatus::WaitingForFirstFrame { .. }
+                ),
                 config.microphone,
                 config.separate_audio_tracks,
                 config.force_gdi,
@@ -267,7 +270,10 @@ impl SessionView {
         mic_muted: bool,
         stop_reason: Option<&StopReason>,
     ) -> Self {
-        let recording = matches!(status, SessionStatus::Recording { .. });
+        let recording = matches!(
+            status,
+            SessionStatus::Recording { .. } | SessionStatus::WaitingForFirstFrame { .. }
+        );
         let line = match status {
             SessionStatus::Recording { elapsed_secs, .. } => recording_status(
                 *elapsed_secs,
@@ -282,6 +288,7 @@ impl SessionView {
                 "MP4",
                 mic_state(mic_on, mic_muted),
             ),
+            SessionStatus::WaitingForFirstFrame { target } => waiting_status(target),
             SessionStatus::Idle => idle_status(stop_reason),
         };
         Self {
@@ -293,9 +300,25 @@ impl SessionView {
     }
 }
 
+/// Builds the waiting status line shown in the menu and as the tooltip while
+/// the capture target has not delivered its first frame, truncated to 127
+/// characters (Windows tooltip cap).
+///
+/// Example: "Featherweight - waiting for Game 🎮…"
+fn waiting_status(target: &str) -> String {
+    let target = if target.is_empty() {
+        "the selected window"
+    } else {
+        target
+    };
+    format!("Featherweight - waiting for {target}…")
+        .chars()
+        .take(127)
+        .collect()
+}
+
 /// Maps the hub's mic flags to the status-line wording.
-fn mic_state(mic_on: bool, mic_muted: bool) -> MicState {
-    if !mic_on {
+fn mic_state(mic_on: bool, mic_muted: bool) -> MicState {    if !mic_on {
         MicState::Off
     } else if mic_muted {
         MicState::Muted

@@ -28,7 +28,7 @@ use std::{
 
 use crate::{
     capture::pipeline,
-    config::AppConfig,
+    config::{AppConfig, CaptureTarget},
     filename,
     log,
 };
@@ -46,6 +46,15 @@ use crate::{
 pub enum SessionStatus {
     /// No session running.
     Idle,
+    /// A session was started but the capture target has not delivered a
+    /// video frame yet — typically a minimized window. No output file
+    /// exists at this point; the session becomes [`SessionStatus::Recording`]
+    /// on the first frame, or returns to [`SessionStatus::Idle`] if stopped
+    /// while waiting.
+    WaitingForFirstFrame {
+        /// Title of the capture target being waited for.
+        target: String,
+    },
     /// A session is running. `elapsed_secs` is refreshed by the recorder's
     /// once-per-second [`RecorderEvent::Progress`] tick.
     Recording {
@@ -59,6 +68,15 @@ pub enum SessionStatus {
 /// Events emitted by the recording pipeline to the UI over an `mpsc` channel.
 #[derive(Debug)]
 pub enum RecorderEvent {
+    /// The session is waiting for the capture target to deliver its first
+    /// frame (a minimized window, for instance). No output file exists yet;
+    /// [`RecorderEvent::Started`] follows once one arrives, so cancelling
+    /// while waiting leaves nothing on disk.
+    Waiting {
+        /// Title of the window being waited for.
+        target: String,
+    },
+
     /// The recorder has opened the output file and begun writing frames.
     /// The path is the final destination of the recording.
     Started(PathBuf),
@@ -297,16 +315,22 @@ fn worker(
 
     log::log(&format!("recording to {}", output_path.display()));
 
-    // Notify the UI that recording has started.
-    let _ = tx.send(RecorderEvent::Started(output_path.clone()));
-    wake();
-
-    // Optional deadline (0 = unlimited).
-    let deadline = if config.duration_minutes > 0 {
-        Some(Instant::now() + Duration::from_secs(config.duration_minutes as u64 * 60))
-    } else {
-        None
+    // Window targets can sit waiting for their first frame (a minimized or
+    // fully static window delivers none); monitors deliver one within
+    // milliseconds, so they start immediately.
+    let wait_target = match config.capture_target {
+        CaptureTarget::Window { title, .. } => Some(title),
+        CaptureTarget::Monitor { .. } => None,
     };
+    if let Some(target) = &wait_target {
+        let _ = tx.send(RecorderEvent::Waiting {
+            target: target.clone(),
+        });
+        wake();
+    } else {
+        let _ = tx.send(RecorderEvent::Started(output_path.clone()));
+        wake();
+    }
 
     // Poll for stop signals, emit Progress ticks, and enforce the duration
     // limit at 50 ms intervals.
@@ -315,17 +339,40 @@ fn worker(
     // the encoder writes `<name>.temp.mp4` and the final file only appears
     // after the mux, so the destination in `Started` would report zero bytes
     // for the whole session.
+    //
+    // While waiting for the first frame there is no file to sample and no
+    // elapsed time to show, so ticks are withheld and the duration deadline
+    // only begins once the session actually starts recording.
     let sampled_path = active.active_file_path().clone();
-    let started = Instant::now();
+    let mut waiting = wait_target.is_some();
+    let mut started: Option<Instant> = None;
+    let mut deadline: Option<Instant> = None;
     let mut last_tick: Option<u64> = None;
     loop {
         thread::sleep(Duration::from_millis(50));
 
-        let timed_out = deadline.is_some_and(|d| Instant::now() >= d);
-        if internal_stop.load(Ordering::Acquire)
-            || external_stop.load(Ordering::Acquire)
-            || timed_out
-        {
+        if internal_stop.load(Ordering::Acquire) || external_stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        if waiting {
+            if active.first_frame_arrived() {
+                waiting = false;
+                started = Some(Instant::now());
+                deadline = if config.duration_minutes > 0 {
+                    Some(Instant::now() + Duration::from_secs(config.duration_minutes as u64 * 60))
+                } else {
+                    None
+                };
+                let _ = tx.send(RecorderEvent::Started(output_path.clone()));
+                wake();
+            }
+            continue;
+        }
+
+        let started = started.expect("recording implies a start instant");
+
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
 

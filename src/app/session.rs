@@ -267,6 +267,11 @@ pub fn spawn_pump(rx: Receiver<RecorderEvent>, shared: Arc<SessionShared>, sessi
             let mut growth = GrowthEstimator::new();
             while let Ok(event) = rx.recv() {
                 match event {
+                    RecorderEvent::Waiting { target } => {
+                        *shared.status.lock().unwrap() =
+                            SessionStatus::WaitingForFirstFrame { target };
+                        shared.egui.request_repaint();
+                    }
                     RecorderEvent::Started(path) => {
                         *shared.status.lock().unwrap() = SessionStatus::Recording {
                             path,
@@ -330,7 +335,7 @@ pub fn spawn_pump(rx: Receiver<RecorderEvent>, shared: Arc<SessionShared>, sessi
                         // recorded: infer it before the state is cleared.
                         let elapsed_secs = match &*shared.status.lock().unwrap() {
                             SessionStatus::Recording { elapsed_secs, .. } => *elapsed_secs,
-                            SessionStatus::Idle => 0,
+                            SessionStatus::WaitingForFirstFrame { .. } | SessionStatus::Idle => 0,
                         };
                         note_duration_limit(&shared, elapsed_secs, duration_secs);
                         finish(&shared);

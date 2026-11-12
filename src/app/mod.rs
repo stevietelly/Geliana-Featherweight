@@ -139,7 +139,7 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
                 last_error: Mutex::new(None),
                 stop_flag: Arc::new(AtomicBool::new(false)),
                 mic_track_on: AtomicBool::new(false),
-                mic_muted: AtomicBool::new(false),
+                mic_muted: Arc::new(AtomicBool::new(false)),
                 prefs_dirty: AtomicBool::new(false),
                 // Seeded from disk so tray checkboxes and "New recording" see
                 // the saved preferences before the window's first frame.

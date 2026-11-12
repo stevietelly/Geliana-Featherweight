@@ -156,7 +156,9 @@ pub struct SessionShared {
     pub mic_track_on: AtomicBool,
     /// Whether the user muted the mic during the current recording. Set by
     /// the tray's "Mute microphone" item; reflected in the status line.
-    pub mic_muted: AtomicBool,
+    /// `Arc` because the recorder thread takes a clone: the mixer polls it
+    /// every mix tick, so muting actually silences the recorded mic track.
+    pub mic_muted: Arc<AtomicBool>,
     /// Set by tray preference handlers after they update `config`; the
     /// window pulls the affected fields into its editable copy on the next
     /// frame so the UI reflects tray-made changes.
@@ -204,7 +206,12 @@ impl SessionShared {
         // Join any finished worker and reset the manager before a new
         // session; a no-op when no session has run yet.
         recorder.clear();
-        let rx = recorder.start(config.clone(), self.stop_flag.clone(), wake);
+        let rx = recorder.start(
+            config.clone(),
+            self.stop_flag.clone(),
+            self.mic_muted.clone(),
+            wake,
+        );
         drop(recorder);
 
         spawn_pump(rx, self.clone(), config);
@@ -430,7 +437,7 @@ mod tests {
             last_error: Mutex::new(None),
             stop_flag: Arc::new(AtomicBool::new(false)),
             mic_track_on: AtomicBool::new(false),
-            mic_muted: AtomicBool::new(false),
+            mic_muted: Arc::new(AtomicBool::new(false)),
             prefs_dirty: AtomicBool::new(false),
             config: Mutex::new(config.clone()),
             recorder: Mutex::new(RecorderManager::default()),

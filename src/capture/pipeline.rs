@@ -593,13 +593,17 @@ impl CaptureSource {
 /// Starts a real recording to `output_path` for the target in `config`.
 ///
 /// `stop_signal` is the session stop flag: the pipeline polls it, and
-/// [`ActiveRecording::stop`] sets it before joining. Returns `Err` if the
-/// target is invalid, the encoder cannot be created, or (for window targets)
-/// WGC cannot start — the GDI fallback only exists for monitor capture.
+/// [`ActiveRecording::stop`] sets it before joining. `mic_muted` is the
+/// shared live-mute flag; the audio mixer polls it every mix tick so the
+/// tray's "Mute microphone" item silences the mic mid-session. Returns
+/// `Err` if the target is invalid, the encoder cannot be created, or (for
+/// window targets) WGC cannot start — the GDI fallback only exists for
+/// monitor capture.
 pub fn start_recording(
     config: &AppConfig,
     output_path: PathBuf,
     stop_signal: Arc<AtomicBool>,
+    mic_muted: &Arc<AtomicBool>,
 ) -> Result<ActiveRecording, String> {
     let env_force_gdi = std::env::var("FEATHERWEIGHT_FORCE_GDI")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -673,7 +677,7 @@ pub fn start_recording(
                     fps: config.fps.max(1),
                     bitrate: config.bitrate_mbps.max(1) * 1_000_000,
                     stop: stop_signal.clone(),
-                    audio: start_audio_pipeline(config, &stop_signal, "WGC"),
+                    audio: start_audio_pipeline(config, &stop_signal, "WGC", mic_muted),
                     mic_pcm_path: mic_pcm_path.clone(),
                     finalization_error: finalization_error.clone(),
                 };
@@ -697,7 +701,7 @@ pub fn start_recording(
                     fps: config.fps.max(1),
                     bitrate: config.bitrate_mbps.max(1) * 1_000_000,
                     stop: stop_signal.clone(),
-                    audio: start_audio_pipeline(config, &stop_signal, "WGC"),
+                    audio: start_audio_pipeline(config, &stop_signal, "WGC", mic_muted),
                     mic_pcm_path: mic_pcm_path.clone(),
                     finalization_error: finalization_error.clone(),
                 };
@@ -781,7 +785,7 @@ pub fn start_recording(
     let fps = config.fps.clamp(1, 30); // GDI compatibility mode caps at 30 FPS
     let bitrate = 6_000_000u32; // 6 Mbps for GDI compatibility
 
-    let audio_pipeline = start_audio_pipeline(config, &stop_signal, "GDI");
+    let audio_pipeline = start_audio_pipeline(config, &stop_signal, "GDI", mic_muted);
 
     let audio_enabled = audio_pipeline.is_some();
     let encoder = VideoEncoder::new(
@@ -943,10 +947,14 @@ fn probe_source(
 /// Starts the WASAPI pipeline for the configured sources, applies the
 /// config's volumes and mic gate, and returns `None` (video-only) if audio
 /// is disabled or fails to start.
+///
+/// `mic_muted` is the shared live-mute flag; the mixer polls it every mix
+/// tick, so the tray's "Mute microphone" item silences the mic mid-session.
 fn start_audio_pipeline(
     config: &AppConfig,
     stop_signal: &Arc<AtomicBool>,
     mode: &str,
+    mic_muted: &Arc<AtomicBool>,
 ) -> Option<AudioPipeline> {
     match AudioPipeline::start(config.system_audio, config.microphone, stop_signal.clone()) {
         Ok(Some(mut pipeline)) => {
@@ -956,6 +964,7 @@ fn start_audio_pipeline(
             ));
             pipeline.set_volumes([config.system_volume, config.microphone_volume]);
             pipeline.set_mic_gate_db(config.microphone_threshold_db);
+            pipeline.set_mic_muted_flag(mic_muted.clone());
             Some(pipeline)
         }
         Ok(None) => {

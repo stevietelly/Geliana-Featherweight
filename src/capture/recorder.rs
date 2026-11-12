@@ -120,7 +120,9 @@ impl RecorderManager {
     ///
     /// `config` is cloned at the call site; subsequent changes to the UI's
     /// copy do not affect the running session. `external_stop` is an
-    /// additional stop signal (e.g. from the tray or a hotkey). `wake` is
+    /// additional stop signal (e.g. from the tray or a hotkey). `mic_muted`
+    /// is the live mute flag: the audio mixer polls it, so the tray's
+    /// "Mute microphone" item silences the mic mid-recording. `wake` is
     /// called after each event so the egui context repaints.
     ///
     /// Runs the real capture pipeline (see [`pipeline`]) unless the
@@ -134,6 +136,7 @@ impl RecorderManager {
         &mut self,
         config: AppConfig,
         external_stop: Arc<AtomicBool>,
+        mic_muted: Arc<AtomicBool>,
         wake: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> mpsc::Receiver<RecorderEvent> {
         let simulate = std::env::var("FEATHERWEIGHT_SIMULATE")
@@ -145,6 +148,8 @@ impl RecorderManager {
         self.stop = Some(stop.clone());
 
         let handle = if simulate {
+            // Simulated sessions have no audio to mute.
+            let _ = mic_muted;
             thread::Builder::new()
                 .name("recorder-simulated".into())
                 .spawn(move || {
@@ -155,7 +160,7 @@ impl RecorderManager {
             thread::Builder::new()
                 .name("recorder-worker".into())
                 .spawn(move || {
-                    worker(config, tx, stop, external_stop, wake);
+                    worker(config, tx, stop, external_stop, mic_muted, wake);
                 })
                 .expect("could not spawn recorder worker")
         };
@@ -261,6 +266,7 @@ fn worker(
     tx: Sender<RecorderEvent>,
     internal_stop: Arc<AtomicBool>,
     external_stop: Arc<AtomicBool>,
+    mic_muted: Arc<AtomicBool>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
     // Resolve output path: directory + filename template + collision suffix.
@@ -274,8 +280,12 @@ fn worker(
     };
 
     // Start the capture pipeline. Failure here is fatal for the session.
-    let active = match pipeline::start_recording(&config, output_path.clone(), internal_stop.clone())
-    {
+    let active = match pipeline::start_recording(
+        &config,
+        output_path.clone(),
+        internal_stop.clone(),
+        &mic_muted,
+    ) {
         Ok(active) => active,
         Err(e) => {
             log::log(&format!("could not start recording: {e}"));

@@ -55,7 +55,7 @@ use crate::log;
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 2;
 const FRAMES_PER_CHUNK: usize = 960;
-const BYTES_PER_FRAME: usize = CHANNELS as usize * std::mem::size_of::<f32>();
+pub(crate) const BYTES_PER_FRAME: usize = CHANNELS as usize * std::mem::size_of::<f32>();
 const MAX_BUFFER_FRAMES: usize = SAMPLE_RATE as usize * 2;
 // How long the mixer waits before emitting audio, to let WASAPI buffers fill.
 // 20ms is enough for WASAPI's ~10ms event cadence while keeping A/V in sync.
@@ -63,17 +63,17 @@ const MAX_BUFFER_FRAMES: usize = SAMPLE_RATE as usize * 2;
 const DEFAULT_MIX_LATENCY: Duration = Duration::from_millis(20);
 const TIMESTAMP_SMOOTHING_FRAMES: u64 = SAMPLE_RATE as u64 * 70 / 1000;
 
-struct ComGuard;
+pub(crate) struct ComGuard;
 impl Drop for ComGuard {
     fn drop(&mut self) {
         wasapi::deinitialize();
     }
 }
 
-struct AudioScheduling(Option<HANDLE>);
+pub(crate) struct AudioScheduling(Option<HANDLE>);
 
 impl AudioScheduling {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         let mut task = 0;
         match unsafe { AvSetMmThreadCharacteristicsW(w!("Audio"), &mut task) } {
             Ok(handle) => Self(Some(handle)),
@@ -93,7 +93,7 @@ impl Drop for AudioScheduling {
     }
 }
 
-struct AudioEvent(HANDLE);
+pub(crate) struct AudioEvent(pub(crate) HANDLE);
 impl Drop for AudioEvent {
     fn drop(&mut self) {
         let _ = unsafe { CloseHandle(self.0) };
@@ -101,7 +101,7 @@ impl Drop for AudioEvent {
 }
 
 #[derive(Clone, Copy)]
-enum Source {
+pub(crate) enum Source {
     System,
     Microphone,
 }
@@ -338,11 +338,23 @@ type SourceBuffers = [Arc<Mutex<SourceBuffer>>; 2];
 struct AudioMixer {
     buffers: SourceBuffers,
     volumes: [f32; 2],
+    /// Live mic-mute flag, polled every mix tick: when set, the mic channel
+    /// is silenced in both the mixed track and the separate mic track.
+    mic_muted: Arc<AtomicBool>,
     microphone_gate: MicrophoneGate,
     position: u64,
 }
 
 impl AudioMixer {
+    /// Effective mic gain: zero while muted, otherwise the configured gain.
+    fn mic_volume(&self) -> f32 {
+        if self.mic_muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            self.volumes[1]
+        }
+    }
+
     fn drain_to(
         &mut self,
         target: u64,
@@ -364,10 +376,10 @@ impl AudioMixer {
             if let Some(sec) = secondary_send.as_mut() {
                 let sys_pcm = f32_to_i16_pcm(&a, self.volumes[0]);
                 send(&sys_pcm)?;
-                let mic_pcm = f32_to_i16_pcm(&b, self.volumes[1]);
+                let mic_pcm = f32_to_i16_pcm(&b, self.mic_volume());
                 sec(&mic_pcm)?;
             } else {
-                let mixed = mix_f32(&a, &b, self.volumes[0], self.volumes[1]);
+                let mixed = mix_f32(&a, &b, self.volumes[0], self.mic_volume());
                 send(&mixed)?;
             }
             self.position += frames as u64;
@@ -393,6 +405,9 @@ pub struct AudioPipeline {
     buffers: SourceBuffers,
     volumes: [f32; 2],
     mic_gate_db: Option<f32>,
+    /// Live mic-mute flag shared with the session hub; consulted by the
+    /// mixer every mix tick. `None` until [`AudioPipeline::set_mic_muted_flag`].
+    mic_muted: Option<Arc<AtomicBool>>,
     clock: Arc<AudioClock>,
     handles: Vec<JoinHandle<()>>,
     writer: Option<JoinHandle<Result<(), String>>>,
@@ -424,6 +439,7 @@ impl AudioPipeline {
             }),
             volumes: [1.0, 1.0],
             mic_gate_db: Some(-40.0),
+            mic_muted: None,
             clock: Arc::new(AudioClock::default()),
             handles: Vec::new(),
             writer: None,
@@ -470,6 +486,13 @@ impl AudioPipeline {
         self.mic_gate_db = threshold_db;
     }
 
+    /// Supplies the shared live-mute flag: while it is set, the mixer emits
+    /// silence for the mic channel. Polled every mix tick (~5 ms), so muting
+    /// and unmuting apply mid-recording.
+    pub fn set_mic_muted_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.mic_muted = Some(flag);
+    }
+
     #[allow(dead_code)]
     pub fn begin_with_sink(
         &mut self,
@@ -504,6 +527,10 @@ impl AudioPipeline {
         let mut mixer = AudioMixer {
             buffers: self.buffers.clone(),
             volumes: self.volumes,
+            mic_muted: self
+                .mic_muted
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             microphone_gate: MicrophoneGate::new(self.mic_gate_db),
             position: 0,
         };
@@ -723,7 +750,7 @@ fn capture_loop(
     result
 }
 
-fn read_capture_packet(
+pub(crate) fn read_capture_packet(
     capture: &IAudioCaptureClient,
 ) -> Result<(Vec<u8>, BufferInfo), Box<dyn std::error::Error + Send + Sync>> {
     let mut data = std::ptr::null_mut();

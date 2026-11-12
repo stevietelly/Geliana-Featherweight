@@ -23,6 +23,7 @@ use crate::{
     },
     capture::{
         monitors::{MonitorInfo, enumerate_monitors},
+        preview::AudioPreview,
         recorder::SessionStatus,
         windows::{WindowInfo, enumerate_windows},
     },
@@ -59,6 +60,16 @@ pub struct FeatherweightApp {
     /// frame hides the window explicitly, because the viewport's initial
     /// visibility is only a hint the windowing layer may not honour.
     hide_on_first_frame: bool,
+    /// Idle audio meters: lightweight WASAPI streams measuring live peaks
+    /// while no recording runs (see `capture::preview`). Dropped when the
+    /// window hides; restarted when it becomes visible again.
+    audio_preview: Option<AudioPreview>,
+    /// Latest raw (pre-gain) peaks from the preview: [system, microphone].
+    /// The volume sliders apply the gain themselves.
+    audio_levels: [f32; 2],
+    /// Sources the preview last tried to capture: (system, microphone).
+    /// A failed start is not retried until the selection changes.
+    preview_signature: (bool, bool),
 }
 
 impl FeatherweightApp {
@@ -118,6 +129,9 @@ impl FeatherweightApp {
                 - std::time::Duration::from_secs(10), // force immediate first check
             window_visible: start_visible,
             hide_on_first_frame: !start_visible,
+            audio_preview: None,
+            audio_levels: [0.0; 2],
+            preview_signature: (false, false),
         }
     }
 
@@ -142,6 +156,12 @@ impl FeatherweightApp {
         if visible {
             // Bring to front when restoring from tray.
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        } else {
+            // No meters to feed while hidden; release the preview streams.
+            // Resetting the signature makes the next visible frame restart
+            // them if the config still has sources enabled.
+            self.audio_preview = None;
+            self.preview_signature = (false, false);
         }
         self.window_visible = visible;
         self.tray.set_window_visible(visible);
@@ -189,8 +209,13 @@ impl FeatherweightApp {
         }
         // Schedule a repaint in 1 s so the readout stays live even when no
         // recorder events are arriving (idle) or one is missed (recording).
+        // With a preview running the meters need ~20 Hz instead.
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
+        if self.audio_preview.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         let hard_floor = crate::disk::hard_floor();
         let free = if recording { stats.free_bytes } else { self.disk_free };
@@ -607,7 +632,7 @@ impl FeatherweightApp {
                                 volume_slider(
                                     ui,
                                     &mut self.config.system_volume,
-                                    0.0, // peak — wire up AudioPreview when available
+                                    self.audio_levels[0],
                                     None,
                                 );
                             });
@@ -618,11 +643,18 @@ impl FeatherweightApp {
                         // Microphone toggle
                         toggle_row(ui, "Microphone", &mut self.config.microphone);
                         if self.config.microphone {
+                            // A muted mic records silence; the meter shows
+                            // that rather than the raw pre-mute signal.
+                            let mic_peak = if self.shared.mic_muted.load(Ordering::Relaxed) {
+                                0.0
+                            } else {
+                                self.audio_levels[1]
+                            };
                             row(ui, "Volume", |ui| {
                                 volume_slider(
                                     ui,
                                     &mut self.config.microphone_volume,
-                                    0.0,
+                                    mic_peak,
                                     self.config.microphone_threshold_db,
                                 );
                             });
@@ -785,8 +817,33 @@ impl FeatherweightApp {
             });
     }
 
+    /// Keeps the idle audio meters alive.
+    ///
+    /// Runs a lightweight WASAPI preview (loopback and/or microphone) that
+    /// measures live signal peaks while no recording is active, restarting
+    /// it whenever the enabled sources change and when the window becomes
+    /// visible again after being hidden. Levels are raw (pre-gain); the
+    /// volume sliders apply the gain themselves, so a meter shows what the
+    /// recording would capture at the current slider position.
     fn update_window_and_audio(&mut self, _ctx: &egui::Context) {
-        
+        let signature = (self.config.system_audio, self.config.microphone);
+        if self.preview_signature != signature {
+            self.preview_signature = signature;
+            self.audio_preview = None;
+            if signature.0 || signature.1 {
+                match AudioPreview::start(signature.0, signature.1) {
+                    Ok(preview) => self.audio_preview = Some(preview),
+                    Err(error) => {
+                        crate::log::log(&format!("audio preview unavailable: {error}"));
+                        self.warning = Some(format!("audio preview unavailable: {error}"));
+                    }
+                }
+            }
+        }
+        self.audio_levels = self
+            .audio_preview
+            .as_ref()
+            .map_or([0.0; 2], |preview| preview.levels());
     }
 }
 
@@ -871,6 +928,12 @@ impl eframe::App for FeatherweightApp {
                 self.set_visible(ui.ctx(), false);
             }
         }
+
+        // ------------------------------------------------------------------
+        // Idle audio meters: start/restart the preview as needed and read
+        // the latest peaks for the volume sliders.
+        // ------------------------------------------------------------------
+        self.update_window_and_audio(ui.ctx());
 
         // ------------------------------------------------------------------
         // Render

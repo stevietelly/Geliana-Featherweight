@@ -965,6 +965,11 @@ fn start_audio_pipeline(
             pipeline.set_volumes([config.system_volume, config.microphone_volume]);
             pipeline.set_mic_gate_db(config.microphone_threshold_db);
             pipeline.set_mic_muted_flag(mic_muted.clone());
+            pipeline.set_noise_suppression(
+                config
+                    .microphone_noise_suppression
+                    .then(|| (config.microphone_noise_method, config.microphone_suppression_db)),
+            );
             Some(pipeline)
         }
         Ok(None) => {

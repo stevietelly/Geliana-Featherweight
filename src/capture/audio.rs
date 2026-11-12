@@ -50,6 +50,8 @@ use windows::{
     core::w,
 };
 
+use super::denoise::MicDenoiser;
+use crate::config::NoiseSuppressionMethod;
 use crate::log;
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -341,6 +343,9 @@ struct AudioMixer {
     /// Live mic-mute flag, polled every mix tick: when set, the mic channel
     /// is silenced in both the mixed track and the separate mic track.
     mic_muted: Arc<AtomicBool>,
+    /// Mic noise suppression, applied before the noise gate so the gate
+    /// sees the cleaned signal. `None` = disabled.
+    denoiser: Option<MicDenoiser>,
     microphone_gate: MicrophoneGate,
     position: u64,
 }
@@ -371,6 +376,9 @@ impl AudioMixer {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take(self.position, frames);
+            if let Some(denoiser) = &mut self.denoiser {
+                denoiser.process(&mut b);
+            }
             self.microphone_gate.apply(&mut b);
 
             if let Some(sec) = secondary_send.as_mut() {
@@ -408,6 +416,9 @@ pub struct AudioPipeline {
     /// Live mic-mute flag shared with the session hub; consulted by the
     /// mixer every mix tick. `None` until [`AudioPipeline::set_mic_muted_flag`].
     mic_muted: Option<Arc<AtomicBool>>,
+    /// Mic noise suppression selected at pipeline start, moved into the
+    /// mixer by [`AudioPipeline::begin_with_sinks`]. `None` = disabled.
+    mic_denoiser: Option<MicDenoiser>,
     clock: Arc<AudioClock>,
     handles: Vec<JoinHandle<()>>,
     writer: Option<JoinHandle<Result<(), String>>>,
@@ -440,6 +451,7 @@ impl AudioPipeline {
             volumes: [1.0, 1.0],
             mic_gate_db: Some(-40.0),
             mic_muted: None,
+            mic_denoiser: None,
             clock: Arc::new(AudioClock::default()),
             handles: Vec::new(),
             writer: None,
@@ -493,6 +505,32 @@ impl AudioPipeline {
         self.mic_muted = Some(flag);
     }
 
+    /// Enables mic noise suppression with the requested engine and strength,
+    /// or disables it with `None`.
+    ///
+    /// The denoiser is built here (at pipeline start) so an engine failure
+    /// degrades to "no suppression" with a log line instead of failing the
+    /// whole session.
+    pub fn set_noise_suppression(&mut self, suppression: Option<(NoiseSuppressionMethod, i32)>) {
+        self.mic_denoiser = match suppression {
+            None => None,
+            Some((method, level_db)) => match MicDenoiser::new(method, level_db) {
+                Ok(denoiser) => {
+                    log::log(&format!(
+                        "audio: mic noise suppression enabled ({method:?}, {level_db} dB)"
+                    ));
+                    Some(denoiser)
+                }
+                Err(error) => {
+                    log::log(&format!(
+                        "audio: mic noise suppression unavailable ({error}); recording without it"
+                    ));
+                    None
+                }
+            },
+        };
+    }
+
     #[allow(dead_code)]
     pub fn begin_with_sink(
         &mut self,
@@ -531,6 +569,7 @@ impl AudioPipeline {
                 .mic_muted
                 .clone()
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            denoiser: self.mic_denoiser.take(),
             microphone_gate: MicrophoneGate::new(self.mic_gate_db),
             position: 0,
         };

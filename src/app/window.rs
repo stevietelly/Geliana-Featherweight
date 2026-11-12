@@ -678,6 +678,40 @@ impl FeatherweightApp {
                                         "Speex",
                                     );
                                 });
+                                // RNNoise has no strength knob; SpeexDSP
+                                // takes a maximum attenuation in dB.
+                                if self.config.microphone_noise_method
+                                    == NoiseSuppressionMethod::Speex
+                                {
+                                    row(ui, "Suppression", |ui| {
+                                        let track_width = (ui.available_width()
+                                            - VALUE_WIDTH
+                                            - ui.spacing().item_spacing.x)
+                                            .max(60.0);
+                                        let slider = ui.scope(|ui| {
+                                            ui.spacing_mut().slider_width = track_width;
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut self
+                                                        .config
+                                                        .microphone_suppression_db,
+                                                    -60..=0,
+                                                )
+                                                .show_value(false),
+                                            )
+                                        });
+                                        ui.add_sized(
+                                            [VALUE_WIDTH, CONTROL_HEIGHT],
+                                            egui::DragValue::new(
+                                                &mut self.config.microphone_suppression_db,
+                                            )
+                                            .range(-60..=0)
+                                            .suffix(" dB"),
+                                        );
+                                        slider.inner
+                                            .on_hover_text("Lower values suppress more noise.");
+                                    });
+                                }
                             }
                         }
 

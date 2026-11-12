@@ -1,0 +1,120 @@
+# Publishes a distributable Windows binary and MSI installer when a pull
+# request is merged.
+#
+# Closing a PR without merging does nothing; merging one runs the test suite,
+# builds the optimized release binary, packages it into a zip with the
+# license/readme, builds an MSI installer with cargo-wix (WiX Toolset v3,
+# driven by wix/main.wxs), and attaches both to a GitHub release tagged after
+# the version in Cargo.toml (e.g. v0.1.0). If that tag already exists, the
+# short commit hash is appended so successive merges still release.
+
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Only actually-merged PRs produce a release.
+    if: github.event.pull_request.merged == true
+    runs-on: windows-latest
+    steps:
+      # The pull_request closed event checks out a throwaway merge ref;
+      # pin to the commit that landed on the default branch so the release
+      # tag points at real history.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # cargo-wix (0.3.x) drives WiX Toolset v3 but does not download it; the
+      # wix311 binaries are fetched explicitly and handed to cargo wix via
+      # -b. (Runner images cannot be relied on to ship WiX v3.)
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
+      - name: Fetch the WiX Toolset binaries
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri `
+            "https://github.com/wixtoolset/wix3/releases/download/wix3112rtm/wix311-binaries.zip" `
+            -OutFile wix311-binaries.zip
+          New-Item -ItemType Directory target\wix\wix311 | Out-Null
+          Expand-Archive -Path wix311-binaries.zip -DestinationPath target\wix\wix311
+          Remove-Item wix311-binaries.zip
+
+      # The release binary was already built above; --no-build skips cargo
+      # wix's own (redundant) build. The installer version and exe path are
+      # injected by cargo-wix ($(var.Version) and CargoTargetBinDir).
+      - name: Create the MSI installer
+        run: cargo wix --no-build -b target\wix\wix311 --target-bin-dir target\release --nocapture
+
+      - name: Read the version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 |
+            ConvertFrom-Json).packages[0].version
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Determine the release tag
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = "v${{ steps.version.outputs.version }}"
+          $existing = git ls-remote --tags origin "refs/tags/$tag"
+          if ($existing) {
+            $tag = "$tag-$('${{ github.sha }}'.Substring(0, 8))"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Package the distribution zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/GelianaFeatherweight.exe dist/
+          Copy-Item LICENSE dist/
+          Copy-Item Readme.md dist/
+          Compress-Archive -Path dist/* `
+            -DestinationPath "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.zip"
+
+      # cargo-wix names the installer after the Cargo.toml version (e.g.
+      # GelianaFeatherweight-0.1.0-x64.msi); rename to the release tag so the
+      # zip and MSI asset names stay consistent even when the tag gains a
+      # short-commit suffix.
+      - name: Name the MSI after the release tag
+        shell: pwsh
+        run: |
+          Copy-Item target/wix/GelianaFeatherweight-*.msi `
+            "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.msi"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" `
+            "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.zip" `
+            "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.msi" `
+            --target "${{ github.event.pull_request.merge_commit_sha }}" `
+            --title "Featherweight ${{ steps.tag.outputs.tag }}" `
+            --notes ("Binary for PR #" + "${{ github.event.pull_request.number }}" + ": " +
+              "${{ github.event.pull_request.title }}" + "`n`n" +
+              "Commit: ${{ github.event.pull_request.merge_commit_sha }}`n" +
+              "Run the exe directly (zip) — no console window, no installer needed.`n" +
+              "Or run the MSI to install to Program Files, with an optional PATH entry.")

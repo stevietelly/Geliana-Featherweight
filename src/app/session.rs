@@ -175,6 +175,10 @@ pub struct SessionShared {
     /// The recorder. The window and the tray both start sessions through
     /// [`SessionShared::start_recording`].
     pub recorder: Mutex<RecorderManager>,
+    /// Set by the single-instance listener when a second launch asks this
+    /// instance to surface its window (see `app::single_instance`). The
+    /// window polls and clears it each frame, calling Visible + Focus.
+    pub show_requested: AtomicBool,
 }
 
 impl SessionShared {
@@ -485,6 +489,7 @@ mod tests {
             prefs_dirty: AtomicBool::new(false),
             config: Mutex::new(config.clone()),
             recorder: Mutex::new(RecorderManager::default()),
+            show_requested: AtomicBool::new(false),
         })
     }
 

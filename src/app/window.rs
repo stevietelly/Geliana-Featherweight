@@ -965,6 +965,15 @@ impl eframe::App for FeatherweightApp {
         }
 
         // ------------------------------------------------------------------
+        // Single-instance surfacing: a second launch flagged the hub; show
+        // and focus this window whether hidden, minimized, or merely behind
+        // others (Visible + Focus through set_visible).
+        // ------------------------------------------------------------------
+        if self.shared.show_requested.swap(false, Ordering::AcqRel) {
+            self.set_visible(ui.ctx(), true);
+        }
+
+        // ------------------------------------------------------------------
         // Tray event polling — handle toggle and quit from the system tray
         // ------------------------------------------------------------------
         for event in self.tray.poll_events() {

@@ -3,6 +3,7 @@ use eframe::{Renderer, UserEvent, WgpuConfiguration};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 use winit::event_loop::{ControlFlow, EventLoop};
+use winit::raw_window_handle::HasWindowHandle;
 
 use crate::capture::recorder::{RecorderManager, SessionStatus};
 use crate::config::AppConfig;
@@ -17,11 +18,29 @@ pub mod window;
 #[cfg(windows)]
 pub mod shutdown;
 
+/// Single-instance protection (second launch surfaces the running window).
+#[cfg(windows)]
+pub mod single_instance;
+
 const APP_NAME: &str = "Featherweight";
 
 pub fn run() -> eframe::Result {
     log::log_init();
     log::log("Initializing Featherweight");
+
+    // Single-instance protection: when an instance is already running, a
+    // second launch must not start — it surfaces the running instance's
+    // window (whether visible or not) and exits before any UI is created,
+    // so there is no tray-icon flicker.
+    #[cfg(windows)]
+    match single_instance::acquire() {
+        single_instance::Acquisition::Acquired => {}
+        single_instance::Acquisition::AlreadyRunning => {
+            log::log("another Featherweight instance is running; surfacing it and exiting");
+            single_instance::signal_previous();
+            return Ok(());
+        }
+    }
 
     // Renderers to try, in order. Glow goes first by default: it is the most
     // compatible backend on Windows, where wgpu's Vulkan path can crash with
@@ -156,6 +175,7 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
                 // the saved preferences before the window's first frame.
                 config: Mutex::new(config.clone()),
                 recorder: Mutex::new(RecorderManager::default()),
+                show_requested: AtomicBool::new(false),
             });
             *hub_for_closure.lock().unwrap() = Some(shared.clone());
 
@@ -166,6 +186,21 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
             // running recording before the process is terminated.
             #[cfg(windows)]
             crate::app::shutdown::spawn(shared.clone());
+
+            // Single-instance show listener: surfaces this instance's window
+            // when a second launch signals it. Needs the main window's Win32
+            // handle because no egui frames run while the window is hidden.
+            #[cfg(windows)]
+            {
+                let main_hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+                    Ok(winit::raw_window_handle::RawWindowHandle::Win32(w)) => w.hwnd.get(),
+                    _ => {
+                        crate::log::log("single-instance: no Win32 window handle; relaunches will not surface this instance");
+                        0
+                    }
+                };
+                crate::app::single_instance::spawn_show_listener(main_hwnd, shared.clone());
+            }
 
             // Tray::new installs its own click/menu handlers (Windows) using
             // the window handle and egui context from `cc`.

@@ -42,6 +42,7 @@ use crate::{
     capture::recorder::{RecorderEvent, RecorderManager, SessionStatus},
     config::AppConfig,
     disk::{self, GrowthEstimator},
+    hotkeys::HotkeyController,
     mem,
 };
 
@@ -175,6 +176,11 @@ pub struct SessionShared {
     /// The recorder. The window and the tray both start sessions through
     /// [`SessionShared::start_recording`].
     pub recorder: Mutex<RecorderManager>,
+    /// Global-hotkey controller (live bindings, suspend flag, stop signal).
+    /// The polling thread is spawned by `app::try_run`; the window rebinds
+    /// through `update`/`suspend`. Owned here so every exit path can stop
+    /// the poller via `finalize_active_session`.
+    pub hotkeys: Arc<HotkeyController>,
     /// Set by the single-instance listener when a second launch asks this
     /// instance to surface its window (see `app::single_instance`). The
     /// window polls and clears it each frame, calling Visible + Focus.
@@ -450,6 +456,11 @@ fn finish(shared: &SessionShared) {
 /// Blocking on the UI thread is intentional: the window is already closing,
 /// and the process must not exit before the file is complete.
 pub fn finalize_active_session(shared: &SessionShared) {
+    // Global hotkeys must not start a new session while the process is
+    // winding down: a session started now would never be finalized and
+    // would leave a truncated file behind. Every exit path goes through
+    // here (event-loop end and WM_ENDSESSION).
+    shared.hotkeys.shutdown();
     let running = matches!(
         *shared.status.lock().unwrap(),
         SessionStatus::Recording { .. } | SessionStatus::WaitingForFirstFrame { .. }
@@ -489,6 +500,7 @@ mod tests {
             prefs_dirty: AtomicBool::new(false),
             config: Mutex::new(config.clone()),
             recorder: Mutex::new(RecorderManager::default()),
+            hotkeys: Arc::new(HotkeyController::new(config.shortcuts)),
             show_requested: AtomicBool::new(false),
         })
     }
@@ -502,6 +514,23 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         done()
+    }
+
+    /// A stop hotkey with no session running must re-arm the shared stop
+    /// flag: the polling thread sets it directly for lowest latency, and
+    /// `finish` (which re-arms it) never runs for a session that never was —
+    /// leaving it set would stop the next session the instant it starts.
+    #[test]
+    fn idle_hotkey_stop_re_arms_the_stop_flag() {
+        let shared = test_shared(&AppConfig::default());
+        // The poller's direct signal arrives first.
+        shared.stop_flag.store(true, Ordering::Release);
+        crate::app::apply_hotkey_event(&shared, crate::hotkeys::HotkeyEvent::Stop);
+        assert!(
+            !shared.stop_flag.load(Ordering::Acquire),
+            "an idle stop left the flag armed"
+        );
+        assert_eq!(*shared.stop_reason.lock().unwrap(), None);
     }
 
     #[test]

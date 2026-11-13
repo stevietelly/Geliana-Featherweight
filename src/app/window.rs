@@ -8,7 +8,7 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use eframe::egui::{
-    self, Align, Button, Color32, ComboBox, RichText, ScrollArea, Stroke,
+    self, Align, Button, Color32, ComboBox, Key, RichText, ScrollArea, Stroke,
 };
 
 use crate::{
@@ -28,12 +28,56 @@ use crate::{
         windows::{WindowInfo, enumerate_windows},
     },
     config::{AppConfig, CaptureTarget, NoiseSuppressionMethod},
+    hotkeys::{Shortcut, input_matches_polling},
     tray::{Tray, TrayEvent},
 };
 
 // ---------------------------------------------------------------------------
 // App struct
 // ---------------------------------------------------------------------------
+
+/// Which shortcut row is being rebound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebindSlot {
+    /// The start-recording hotkey.
+    Start,
+    /// The stop-recording hotkey.
+    Stop,
+}
+
+impl RebindSlot {
+    /// Human name for messages.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+        }
+    }
+
+    /// The slot's current binding in a shortcut pair.
+    fn get(self, shortcuts: crate::hotkeys::Shortcuts) -> Shortcut {
+        match self {
+            Self::Start => shortcuts.start,
+            Self::Stop => shortcuts.stop,
+        }
+    }
+
+    /// Writes a new binding into a shortcut pair.
+    fn set(self, shortcuts: &mut crate::hotkeys::Shortcuts, value: Shortcut) {
+        match self {
+            Self::Start => shortcuts.start = value,
+            Self::Stop => shortcuts.stop = value,
+        }
+    }
+
+    /// The *other* slot, for conflict messages.
+    fn other(self) -> Self {
+        match self {
+            Self::Start => Self::Stop,
+            Self::Stop => Self::Start,
+        }
+    }
+}
 
 pub struct FeatherweightApp {
     /// System tray icon and menu (main-thread-bound; visuals are synced
@@ -70,6 +114,13 @@ pub struct FeatherweightApp {
     /// Sources the preview last tried to capture: (system, microphone).
     /// A failed start is not retried until the selection changes.
     preview_signature: (bool, bool),
+    /// Shortcut row currently being rebound, if any. While set, the global
+    /// hotkey poller is suspended (so the new keys cannot fire the current
+    /// bindings) and the next key press becomes the binding.
+    rebinding: Option<RebindSlot>,
+    /// Transient message for the shortcuts card: guidance, or the outcome of
+    /// the last rebind. The `bool` selects error styling.
+    rebind_note: Option<(String, bool)>,
 }
 
 impl FeatherweightApp {
@@ -132,6 +183,8 @@ impl FeatherweightApp {
             audio_preview: None,
             audio_levels: [0.0; 2],
             preview_signature: (false, false),
+            rebinding: None,
+            rebind_note: None,
         }
     }
 
@@ -162,6 +215,13 @@ impl FeatherweightApp {
             // them if the config still has sources enabled.
             self.audio_preview = None;
             self.preview_signature = (false, false);
+
+            // A rebinding left open while the window hides would wait for a
+            // key press indefinitely on reopen; cancel it and re-arm the
+            // global poller.
+            if self.rebinding.is_some() {
+                self.end_rebinding();
+            }
         }
         self.window_visible = visible;
         self.tray.set_window_visible(visible);
@@ -178,6 +238,96 @@ impl FeatherweightApp {
     /// so an automatic stop is distinguishable from a user one afterwards.
     fn stop_recording(&self) {
         self.shared.request_stop(StopReason::User);
+    }
+
+    // -----------------------------------------------------------------------
+    // Hotkey rebinding
+    // -----------------------------------------------------------------------
+
+    /// Leaves rebind capture mode and re-arms the global poller. Every exit
+    /// path from capture mode (Esc, clicking the row again, a successful
+    /// binding, hiding the window) must call this — the poller is suspended
+    /// the whole time.
+    fn end_rebinding(&mut self) {
+        self.shared.hotkeys.suspend(false);
+        self.rebinding = None;
+        self.rebind_note = None;
+    }
+
+    /// Consumes key input while a shortcut row is in capture mode.
+    ///
+    /// Called from the shortcuts card each frame; when nothing is being
+    /// rebound it returns immediately. Rules, in order:
+    /// - Esc cancels.
+    /// - A key the poller cannot represent (not in the `KEYS` table, or a
+    ///   bare letter with no modifier) is rejected with a hint.
+    /// - A press that cannot be verified as the *physical* key it maps to
+    ///   (keypad digits merge onto top-row digits in egui; Windows-key
+    ///   contamination) is rejected — the poller would never see it.
+    /// - A binding equal to the other shortcut is rejected as a conflict.
+    /// - Anything else is applied: config, the live controller, and saved on
+    ///     the frame's regular config-change sweep.
+    fn poll_rebind_input(&mut self, ctx: &egui::Context) {
+        let Some(slot) = self.rebinding else { return };
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event
+            else {
+                continue;
+            };
+
+            if key == Key::Escape {
+                self.end_rebinding();
+                return;
+            }
+
+            let Some(pressed) = Shortcut::from_input(key, modifiers) else {
+                self.rebind_note = Some((
+                    "That key can't be a global shortcut — use a letter, digit, F-key, or add \
+                     Ctrl/Alt/Shift."
+                        .to_owned(),
+                    true,
+                ));
+                continue;
+            };
+
+            // The egui press must be the same physical key the global poller
+            // watches; otherwise the binding would be dead on arrival.
+            if !input_matches_polling(pressed) {
+                self.rebind_note = Some((
+                    "Key press couldn't be verified (keypad and Windows-key presses don't \
+                     register globally) — press it again."
+                        .to_owned(),
+                    true,
+                ));
+                continue;
+            }
+
+            let mut candidate = self.config.shortcuts;
+            slot.set(&mut candidate, pressed);
+            if !candidate.is_valid() {
+                self.rebind_note = Some((
+                    format!(
+                        "That's already the {} shortcut — pick a different combination.",
+                        slot.other().name().to_lowercase()
+                    ),
+                    true,
+                ));
+                continue;
+            }
+
+            self.config.shortcuts = candidate;
+            // Push to the live controller; `update` bumps the revision so the
+            // edge detector waits for all keys to be released before firing —
+            // the just-pressed combination is likely still held.
+            self.shared.hotkeys.update(candidate);
+            self.rebind_note = Some((
+                format!("{} shortcut set to {}.", slot.name(), pressed.label()),
+                false,
+            ));
+            self.end_rebinding();
+            return;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -861,20 +1011,72 @@ impl FeatherweightApp {
                         ui.separator();
                         ui.add_space(6.0);
 
-                        // Shortcuts (read-only display — editing not wired yet)
+                        // Shortcuts — global start/stop hotkeys, polled even
+                        // while this window is hidden. Click a row to rebind:
+                        // the next key press becomes the binding, Esc or
+                        // clicking the row again cancels.
                         section_title(ui, "Shortcuts");
-                        row(ui, "Start", |ui| {
-                            ui.add_sized(
-                                [ui.available_width(), CONTROL_HEIGHT],
-                                Button::new(self.config.shortcuts.start.label()),
+                        ui.label(
+                            RichText::new(
+                                "Work anywhere — even while this window is hidden or another \
+                                 app has focus.",
+                            )
+                            .size(12.0)
+                            .color(MUTED),
+                        );
+                        ui.add_space(4.0);
+
+                        // Consume key events while a row is being rebound,
+                        // before the buttons render this frame.
+                        self.poll_rebind_input(ui.ctx());
+
+                        for (slot, name) in
+                            [(RebindSlot::Start, "Start"), (RebindSlot::Stop, "Stop")]
+                        {
+                            row(ui, name, |ui| {
+                                let editing = self.rebinding == Some(slot);
+                                let label = if editing {
+                                    "Press keys…".to_owned()
+                                } else {
+                                    slot.get(self.config.shortcuts).label()
+                                };
+                                let button = ui.add_sized(
+                                    [ui.available_width(), CONTROL_HEIGHT],
+                                    Button::new(label),
+                                );
+                                if button.clicked() {
+                                    if editing {
+                                        // Click the active row again to cancel.
+                                        self.end_rebinding();
+                                    } else {
+                                        // Suspend the global poller first: while
+                                        // capturing, the new keys must not fire
+                                        // the current bindings.
+                                        self.shared.hotkeys.suspend(true);
+                                        self.rebinding = Some(slot);
+                                        self.rebind_note = None;
+                                    }
+                                }
+                            });
+                        }
+
+                        if let Some((note, error)) = &self.rebind_note {
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(note.clone())
+                                    .size(12.0)
+                                    .color(if *error { widgets::ERROR } else { MUTED }),
                             );
-                        });
-                        row(ui, "Stop", |ui| {
-                            ui.add_sized(
-                                [ui.available_width(), CONTROL_HEIGHT],
-                                Button::new(self.config.shortcuts.stop.label()),
+                        } else if self.rebinding.is_some() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(
+                                    "Press the new key combination, then release. Esc cancels.",
+                                )
+                                .size(12.0)
+                                .color(MUTED),
                             );
-                        });
+                        }
                     });
                 });
             });

@@ -122,15 +122,22 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
         ..Default::default()
     };
 
+    // The session hub is the meeting point between the recorder, the UI, and
+    // the tray (see session.rs). It is built inside the creator closure below
+    // because it needs the real egui context from `cc`; the closure stashes a
+    // clone in this handle so `try_run` can still reach it after the event
+    // loop ends and finalize a still-running session (see
+    // `finalize_active_session`).
+    let hub_handle: Arc<Mutex<Option<Arc<session::SessionShared>>>> = Arc::default();
+    let hub_for_closure = hub_handle.clone();
+
     let mut app = eframe::create_native(
         APP_NAME,
         native_options,
         Box::new(move |cc| {
-            // The session hub is the meeting point between the recorder, the
-            // UI, and the tray (see session.rs). The window mirrors its
-            // config into the hub and pulls tray-made preference changes;
-            // the pump thread writes recording status; the tray acts through
-            // it (stop, new recording, folder, prefs).
+            // The window mirrors its config into the hub and pulls tray-made
+            // preference changes; the pump thread writes recording status;
+            // the tray acts through it (stop, new recording, folder, prefs).
             let shared = Arc::new(session::SessionShared {
                 egui: cc.egui_ctx.clone(),
                 status: Mutex::new(SessionStatus::Idle),
@@ -146,6 +153,7 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
                 config: Mutex::new(config.clone()),
                 recorder: Mutex::new(RecorderManager::default()),
             });
+            *hub_for_closure.lock().unwrap() = Some(shared.clone());
 
             // Tray::new installs its own click/menu handlers (Windows) using
             // the window handle and egui context from `cc`.
@@ -161,9 +169,18 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
 
     log::log("Starting Featherweight event loop");
 
-    event_loop
-        .run_app(&mut app)
-        .map_err(eframe::Error::WinitEventLoop)
+    let run_result = event_loop.run_app(&mut app);
+
+    // The event loop has ended (tray Quit, close-with-quit, or a renderer
+    // error). If a session is still running, stop it and wait for the worker
+    // to finalize the encoder and run the mux — quitting mid-encode must not
+    // leave an unplayable file behind. The handle is None only if the app was
+    // never created, in which case nothing could have been recording.
+    if let Some(shared) = hub_handle.lock().unwrap().take() {
+        session::finalize_active_session(&shared);
+    }
+
+    run_result.map_err(eframe::Error::WinitEventLoop)
 }
 
 /// Whether the window is shown when the app starts.

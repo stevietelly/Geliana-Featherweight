@@ -910,17 +910,25 @@ impl FeatherweightApp {
     }
 }
 
-/// Recording-bar readout: "86.4 MB · 1.4 MB/s", degrading to just the size
-/// before the estimator has a rate, and to a placeholder before the encoder has
-/// written anything.
+/// Recording-bar readout: "86.4 MB · 1.4 MB/s · RAM 214 MB", degrading to
+/// just the pieces that have been measured, and to a placeholder before the
+/// encoder has written anything.
 fn stats_readout(stats: &SessionStats) -> String {
-    if stats.file_size == 0 {
-        return "starting…".to_owned();
+    let mut parts: Vec<String> = Vec::new();
+    if stats.file_size > 0 {
+        let size = crate::disk::format_bytes(stats.file_size);
+        match stats.growth_bps {
+            Some(rate) => parts.push(format!("{size} · {}", crate::disk::format_rate(rate))),
+            None => parts.push(size),
+        }
     }
-    let size = crate::disk::format_bytes(stats.file_size);
-    match stats.growth_bps {
-        Some(rate) => format!("{size} · {}", crate::disk::format_rate(rate)),
-        None => size,
+    if let Some(ram) = stats.ram_bytes {
+        parts.push(format!("RAM {}", crate::disk::format_bytes(ram)));
+    }
+    if parts.is_empty() {
+        "starting…".to_owned()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -954,6 +962,15 @@ impl eframe::App for FeatherweightApp {
             self.config.microphone = snapshot.microphone;
             self.config.separate_audio_tracks = snapshot.separate_audio_tracks;
             self.config.force_gdi = snapshot.force_gdi;
+        }
+
+        // ------------------------------------------------------------------
+        // Single-instance surfacing: a second launch flagged the hub; show
+        // and focus this window whether hidden, minimized, or merely behind
+        // others (Visible + Focus through set_visible).
+        // ------------------------------------------------------------------
+        if self.shared.show_requested.swap(false, Ordering::AcqRel) {
+            self.set_visible(ui.ctx(), true);
         }
 
         // ------------------------------------------------------------------

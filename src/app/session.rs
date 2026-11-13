@@ -42,6 +42,7 @@ use crate::{
     capture::recorder::{RecorderEvent, RecorderManager, SessionStatus},
     config::AppConfig,
     disk::{self, GrowthEstimator},
+    mem,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +122,9 @@ pub struct SessionStats {
     pub disk_warn: bool,
     /// Free space has reached the hard floor; the session is being stopped.
     pub disk_critical: bool,
+    /// Physical RAM the whole process is using (its working set), sampled
+    /// once per tick; `None` when the OS query failed.
+    pub ram_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +175,10 @@ pub struct SessionShared {
     /// The recorder. The window and the tray both start sessions through
     /// [`SessionShared::start_recording`].
     pub recorder: Mutex<RecorderManager>,
+    /// Set by the single-instance listener when a second launch asks this
+    /// instance to surface its window (see `app::single_instance`). The
+    /// window polls and clears it each frame, calling Visible + Focus.
+    pub show_requested: AtomicBool,
 }
 
 impl SessionShared {
@@ -297,13 +305,16 @@ pub fn spawn_pump(rx: Receiver<RecorderEvent>, shared: Arc<SessionShared>, sessi
                         // machine cannot make the rate read low.
                         let growth_bps = growth.push_at(sampled_at, file_size);
                         let free_bytes = disk::free_bytes_for_path(&output_dir);
-                        let stats = compose_stats(
+                        let mut stats = compose_stats(
                             file_size,
                             growth_bps,
                             free_bytes,
                             elapsed_secs,
                             duration_secs,
                         );
+                        // One OS memory query per second, same cadence as the
+                        // disk sample; the readout never needs this fresher.
+                        stats.ram_bytes = mem::process_working_set();
                         let disk_critical = stats.disk_critical;
                         *shared.stats.lock().unwrap() = stats;
 
@@ -405,6 +416,9 @@ fn compose_stats(
         eta_secs,
         disk_warn,
         disk_critical,
+        // Sampled by the pump right after this returns (it is an OS query,
+        // not a pure input, so it stays out of the testable signature).
+        ram_bytes: None,
     }
 }
 
@@ -419,6 +433,35 @@ fn finish(shared: &SessionShared) {
     // Re-arm the external stop flag for the next session.
     shared.stop_flag.store(false, Ordering::Release);
     shared.egui.request_repaint();
+}
+
+/// Stops any running session and waits for it to finish writing.
+///
+/// Called once the event loop has ended (see `app::try_run`). Quitting with a
+/// session active must not kill the process while the encoder is mid-stream —
+/// an MP4 without its moov box is unplayable — or while the separate-track mux
+/// is still running. Setting the stop flag is not enough on its own: the pump
+/// thread holds an `Arc` to the hub, so nothing drops the manager at exit and
+/// the worker would simply be killed when the process ends. This joins it
+/// explicitly; the worker's normal stop path (`ActiveRecording::stop`)
+/// finalizes the video, muxes the mic track, and cleans up waiting-state
+/// sessions with no file at all.
+///
+/// Blocking on the UI thread is intentional: the window is already closing,
+/// and the process must not exit before the file is complete.
+pub fn finalize_active_session(shared: &SessionShared) {
+    let running = matches!(
+        *shared.status.lock().unwrap(),
+        SessionStatus::Recording { .. } | SessionStatus::WaitingForFirstFrame { .. }
+    );
+    if !running {
+        return;
+    }
+    crate::log::log("app exiting with a session active; finalizing the output before exit");
+    // stop + join. `RecorderManager::shutdown` is safe with no session
+    // running, and the status check above only skips the log line.
+    shared.recorder.lock().unwrap().shutdown();
+    crate::log::log("app exit: session finalized");
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +489,7 @@ mod tests {
             prefs_dirty: AtomicBool::new(false),
             config: Mutex::new(config.clone()),
             recorder: Mutex::new(RecorderManager::default()),
+            show_requested: AtomicBool::new(false),
         })
     }
 
@@ -594,5 +638,39 @@ mod tests {
         assert_eq!(*shared.stats.lock().unwrap(), SessionStats::default());
         assert!(!shared.stop_flag.load(Ordering::Acquire), "flag not re-armed");
         manager.shutdown();
+    }
+
+    /// Quitting with a session running finalizes it: `finalize_active_session`
+    /// joins the worker, and the pump publishes Finished, so the process never
+    /// dies mid-encode with an unplayable file.
+    #[test]
+    fn finalize_active_session_stops_a_running_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut config = AppConfig::default();
+        config.output_dir = dir.path().to_path_buf();
+        config.bitrate_mbps = 8;
+        config.duration_minutes = 0; // unlimited — only the exit finalizes it
+
+        let shared = test_shared(&config);
+        // Start through the hub's own manager, the way `try_run` wires it, so
+        // `finalize_active_session` reaches the same worker.
+        let rx = shared.recorder.lock().unwrap().start_record(
+            config.clone(),
+            shared.stop_flag.clone(),
+            Arc::new(|| {}),
+        );
+        spawn_pump(rx, shared.clone(), config.clone());
+
+        let started = wait_until(Duration::from_secs(5), || {
+            matches!(*shared.status.lock().unwrap(), SessionStatus::Recording { .. })
+        });
+        assert!(started, "session never started");
+
+        finalize_active_session(&shared);
+
+        let idle = wait_until(Duration::from_secs(5), || {
+            matches!(*shared.status.lock().unwrap(), SessionStatus::Idle)
+        });
+        assert!(idle, "session was not finalized on exit");
     }
 }

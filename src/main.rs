@@ -10,6 +10,7 @@ mod config;
 mod capture;
 mod hotkeys;
 mod disk;
+mod mem;
 mod filename;
 
 

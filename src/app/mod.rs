@@ -3,6 +3,7 @@ use eframe::{Renderer, UserEvent, WgpuConfiguration};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 use winit::event_loop::{ControlFlow, EventLoop};
+use winit::raw_window_handle::HasWindowHandle;
 
 use crate::capture::recorder::{RecorderManager, SessionStatus};
 use crate::config::AppConfig;
@@ -13,11 +14,33 @@ pub mod theme;
 pub mod widgets;
 pub mod window;
 
+/// Windows session-end watcher (shutdown/logoff finalize).
+#[cfg(windows)]
+pub mod shutdown;
+
+/// Single-instance protection (second launch surfaces the running window).
+#[cfg(windows)]
+pub mod single_instance;
+
 const APP_NAME: &str = "Featherweight";
 
 pub fn run() -> eframe::Result {
     log::log_init();
     log::log("Initializing Featherweight");
+
+    // Single-instance protection: when an instance is already running, a
+    // second launch must not start — it surfaces the running instance's
+    // window (whether visible or not) and exits before any UI is created,
+    // so there is no tray-icon flicker.
+    #[cfg(windows)]
+    match single_instance::acquire() {
+        single_instance::Acquisition::Acquired => {}
+        single_instance::Acquisition::AlreadyRunning => {
+            log::log("another Featherweight instance is running; surfacing it and exiting");
+            single_instance::signal_previous();
+            return Ok(());
+        }
+    }
 
     // Renderers to try, in order. Glow goes first by default: it is the most
     // compatible backend on Windows, where wgpu's Vulkan path can crash with
@@ -122,15 +145,22 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
         ..Default::default()
     };
 
+    // The session hub is the meeting point between the recorder, the UI, and
+    // the tray (see session.rs). It is built inside the creator closure below
+    // because it needs the real egui context from `cc`; the closure stashes a
+    // clone in this handle so `try_run` can still reach it after the event
+    // loop ends and finalize a still-running session (see
+    // `finalize_active_session`).
+    let hub_handle: Arc<Mutex<Option<Arc<session::SessionShared>>>> = Arc::default();
+    let hub_for_closure = hub_handle.clone();
+
     let mut app = eframe::create_native(
         APP_NAME,
         native_options,
         Box::new(move |cc| {
-            // The session hub is the meeting point between the recorder, the
-            // UI, and the tray (see session.rs). The window mirrors its
-            // config into the hub and pulls tray-made preference changes;
-            // the pump thread writes recording status; the tray acts through
-            // it (stop, new recording, folder, prefs).
+            // The window mirrors its config into the hub and pulls tray-made
+            // preference changes; the pump thread writes recording status;
+            // the tray acts through it (stop, new recording, folder, prefs).
             let shared = Arc::new(session::SessionShared {
                 egui: cc.egui_ctx.clone(),
                 status: Mutex::new(SessionStatus::Idle),
@@ -145,7 +175,32 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
                 // the saved preferences before the window's first frame.
                 config: Mutex::new(config.clone()),
                 recorder: Mutex::new(RecorderManager::default()),
+                show_requested: AtomicBool::new(false),
             });
+            *hub_for_closure.lock().unwrap() = Some(shared.clone());
+
+            // Watch for Windows ending the session (shutdown, logoff, or a
+            // restart-manager close such as installing our own MSI over a
+            // running app): those paths bypass the eframe event loop, so a
+            // hidden window watches for WM_ENDSESSION and finalizes any
+            // running recording before the process is terminated.
+            #[cfg(windows)]
+            crate::app::shutdown::spawn(shared.clone());
+
+            // Single-instance show listener: surfaces this instance's window
+            // when a second launch signals it. Needs the main window's Win32
+            // handle because no egui frames run while the window is hidden.
+            #[cfg(windows)]
+            {
+                let main_hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+                    Ok(winit::raw_window_handle::RawWindowHandle::Win32(w)) => w.hwnd.get(),
+                    _ => {
+                        crate::log::log("single-instance: no Win32 window handle; relaunches will not surface this instance");
+                        0
+                    }
+                };
+                crate::app::single_instance::spawn_show_listener(main_hwnd, shared.clone());
+            }
 
             // Tray::new installs its own click/menu handlers (Windows) using
             // the window handle and egui context from `cc`.
@@ -161,9 +216,18 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
 
     log::log("Starting Featherweight event loop");
 
-    event_loop
-        .run_app(&mut app)
-        .map_err(eframe::Error::WinitEventLoop)
+    let run_result = event_loop.run_app(&mut app);
+
+    // The event loop has ended (tray Quit, close-with-quit, or a renderer
+    // error). If a session is still running, stop it and wait for the worker
+    // to finalize the encoder and run the mux — quitting mid-encode must not
+    // leave an unplayable file behind. The handle is None only if the app was
+    // never created, in which case nothing could have been recording.
+    if let Some(shared) = hub_handle.lock().unwrap().take() {
+        session::finalize_active_session(&shared);
+    }
+
+    run_result.map_err(eframe::Error::WinitEventLoop)
 }
 
 /// Whether the window is shown when the app starts.

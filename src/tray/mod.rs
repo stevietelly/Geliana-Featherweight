@@ -146,11 +146,6 @@ impl Tray {
         #[cfg(not(windows))]
         let _ = cc;
 
-        todo_feature(
-            "Quit while recording",
-            "Quit exits immediately; stop and finalize any active recording first",
-        );
-
         Ok(Self {
             icon: tray_icon,
             menu: items,

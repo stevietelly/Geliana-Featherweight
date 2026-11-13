@@ -13,6 +13,10 @@ pub mod theme;
 pub mod widgets;
 pub mod window;
 
+/// Windows session-end watcher (shutdown/logoff finalize).
+#[cfg(windows)]
+pub mod shutdown;
+
 const APP_NAME: &str = "Featherweight";
 
 pub fn run() -> eframe::Result {
@@ -154,6 +158,14 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
                 recorder: Mutex::new(RecorderManager::default()),
             });
             *hub_for_closure.lock().unwrap() = Some(shared.clone());
+
+            // Watch for Windows ending the session (shutdown, logoff, or a
+            // restart-manager close such as installing our own MSI over a
+            // running app): those paths bypass the eframe event loop, so a
+            // hidden window watches for WM_ENDSESSION and finalizes any
+            // running recording before the process is terminated.
+            #[cfg(windows)]
+            crate::app::shutdown::spawn(shared.clone());
 
             // Tray::new installs its own click/menu handlers (Windows) using
             // the window handle and egui context from `cc`.

@@ -278,6 +278,7 @@ impl SessionView {
             SessionStatus::Recording { elapsed_secs, .. } => recording_status(
                 *elapsed_secs,
                 stats.file_size,
+                stats.ram_bytes,
                 stats.free_bytes,
                 stats.eta_secs.map(|secs| secs as f64 / 60.0),
                 stats.disk_warn,
@@ -629,12 +630,14 @@ pub fn format_duration(secs: u64) -> String {
 /// to 127 characters (Windows tooltip cap).
 ///
 /// Unknown segments are omitted rather than shown as zero, so the line never
-/// claims a size or a free-space figure the recorder has not measured.
+/// claims a size, a free-space figure, or a RAM figure the recorder has not
+/// measured.
 ///
-/// Example: "Recording 00:12:34 | 3.2 GB | 41.2 GB free | ~54 min left | MP4 | mic muted"
+/// Example: "Recording 00:12:34 | 3.2 GB | RAM 214 MB | 41.2 GB free | ~54 min left | MP4 | mic muted"
 pub fn recording_status(
     elapsed_secs: u64,
     file_size: u64,
+    ram_bytes: Option<u64>,
     free_bytes: Option<u64>,
     eta_min: Option<f64>,
     disk_warn: bool,
@@ -647,6 +650,9 @@ pub fn recording_status(
     // 0 means the encoder has not flushed anything yet.
     if file_size > 0 {
         parts.push(format_bytes(file_size));
+    }
+    if let Some(ram) = ram_bytes {
+        parts.push(format!("RAM {}", format_bytes(ram)));
     }
     if let Some(free) = free_bytes {
         parts.push(format!("{} free", format_bytes(free)));
@@ -680,16 +686,17 @@ mod tests {
 
     #[test]
     fn unknown_values_are_omitted_instead_of_zeroed() {
-        let line = recording_status(1, 0, None, None, false, "", "MP4", MicState::Off);
+        let line = recording_status(1, 0, None, None, None, false, "", "MP4", MicState::Off);
         assert_eq!(line, "Recording 00:00:01");
         assert!(!line.contains("0 B"));
     }
 
     #[test]
-    fn full_line_carries_size_free_space_and_eta() {
+    fn full_line_carries_size_ram_free_space_and_eta() {
         let line = recording_status(
             754,
             3_221_225_472,
+            Some(224_804_864),
             Some(129_000_000_000),
             Some(54.4),
             false,
@@ -699,27 +706,27 @@ mod tests {
         );
         assert_eq!(
             line,
-            "Recording 00:12:34 | 3.0 GB | 120.1 GB free | ~54 min left | Quick Sync | MP4 | mic muted"
+            "Recording 00:12:34 | 3.0 GB | RAM 214.4 MB | 120.1 GB free | ~54 min left | Quick Sync | MP4 | mic muted"
         );
     }
 
     #[test]
     fn disk_warning_prefixes_the_line() {
-        let line = recording_status(5, 1024, Some(2048), None, true, "", "MP4", MicState::Off);
+        let line = recording_status(5, 1024, None, Some(2048), None, true, "", "MP4", MicState::Off);
         assert!(line.starts_with("Low disk | "), "{line}");
     }
 
     #[test]
     fn sub_minute_eta_is_dropped() {
-        let line = recording_status(5, 1024, Some(2048), Some(0.4), false, "", "MP4", MicState::Off);
+        let line = recording_status(5, 1024, None, Some(2048), Some(0.4), false, "", "MP4", MicState::Off);
         assert!(!line.contains("min left"), "{line}");
     }
 
     #[test]
     fn encoder_and_container_appear_only_when_known() {
-        let hidden = recording_status(5, 1024, None, None, false, "", "MP4", MicState::Off);
+        let hidden = recording_status(5, 1024, None, None, None, false, "", "MP4", MicState::Off);
         assert!(!hidden.contains("MP4"), "{hidden}");
-        let shown = recording_status(5, 1024, None, None, false, "Quick Sync", "MP4", MicState::Off);
+        let shown = recording_status(5, 1024, None, None, None, false, "Quick Sync", "MP4", MicState::Off);
         assert!(shown.ends_with("Quick Sync | MP4"), "{shown}");
     }
 
@@ -728,6 +735,7 @@ mod tests {
         let line = recording_status(
             99_999,
             9_999_999_999,
+            Some(9_999_999_999),
             Some(9_999_999_999),
             Some(9_999.0),
             true,

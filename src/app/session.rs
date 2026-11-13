@@ -42,6 +42,7 @@ use crate::{
     capture::recorder::{RecorderEvent, RecorderManager, SessionStatus},
     config::AppConfig,
     disk::{self, GrowthEstimator},
+    mem,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +122,9 @@ pub struct SessionStats {
     pub disk_warn: bool,
     /// Free space has reached the hard floor; the session is being stopped.
     pub disk_critical: bool,
+    /// Physical RAM the whole process is using (its working set), sampled
+    /// once per tick; `None` when the OS query failed.
+    pub ram_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,13 +301,16 @@ pub fn spawn_pump(rx: Receiver<RecorderEvent>, shared: Arc<SessionShared>, sessi
                         // machine cannot make the rate read low.
                         let growth_bps = growth.push_at(sampled_at, file_size);
                         let free_bytes = disk::free_bytes_for_path(&output_dir);
-                        let stats = compose_stats(
+                        let mut stats = compose_stats(
                             file_size,
                             growth_bps,
                             free_bytes,
                             elapsed_secs,
                             duration_secs,
                         );
+                        // One OS memory query per second, same cadence as the
+                        // disk sample; the readout never needs this fresher.
+                        stats.ram_bytes = mem::process_working_set();
                         let disk_critical = stats.disk_critical;
                         *shared.stats.lock().unwrap() = stats;
 
@@ -405,6 +412,9 @@ fn compose_stats(
         eta_secs,
         disk_warn,
         disk_critical,
+        // Sampled by the pump right after this returns (it is an OS query,
+        // not a pure input, so it stays out of the testable signature).
+        ram_bytes: None,
     }
 }
 

@@ -345,8 +345,16 @@ fn worker(
     // only begins once the session actually starts recording.
     let sampled_path = active.active_file_path().clone();
     let mut waiting = wait_target.is_some();
-    let mut started: Option<Instant> = None;
-    let mut deadline: Option<Instant> = None;
+    // Monitors start immediately; window targets only get a start instant
+    // once the first frame arrives (the transition branch below).
+    let mut started = if waiting { None } else { Some(Instant::now()) };
+    let mut deadline = if waiting {
+        None
+    } else if config.duration_minutes > 0 {
+        Some(Instant::now() + Duration::from_secs(config.duration_minutes as u64 * 60))
+    } else {
+        None
+    };
     let mut last_tick: Option<u64> = None;
     loop {
         thread::sleep(Duration::from_millis(50));

@@ -223,7 +223,10 @@ fn set_preference(shared: &Arc<SessionShared>, apply: impl FnOnce(&mut AppConfig
 }
 
 /// Opens `dir` in the platform file manager, creating it first if needed.
-fn open_folder(dir: &Path) -> Result<(), String> {
+///
+/// Shared with the Recording view's Open folder button, which opens the
+/// current session's parent directory.
+pub(crate) fn open_folder(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create folder: {e}"))?;
 
     #[cfg(windows)]

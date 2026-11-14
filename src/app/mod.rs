@@ -9,6 +9,7 @@ use crate::capture::recorder::{RecorderManager, SessionStatus};
 use crate::config::AppConfig;
 use crate::log;
 
+pub mod about;
 pub mod session;
 pub mod theme;
 pub mod widgets;

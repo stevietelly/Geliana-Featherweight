@@ -24,7 +24,9 @@ pub(crate) const METER_BG: Color32 = Color32::from_rgb(20, 24, 30);
 pub(crate) const LABEL_WIDTH: f32 = 120.0;
 pub(crate) const CONTROL_HEIGHT: f32 = 28.0;
 
-const APP_ICON: &[u8] = include_bytes!("../assets/Featherweight_App_Icon_256.png");
+/// The 256 px application icon, embedded so both the window/taskbar icon and
+/// the About view can share one decoded source.
+pub(crate) const APP_ICON: &[u8] = include_bytes!("../assets/Featherweight_App_Icon_256.png");
 
 // ---------------------------------------------------------------------------
 // Window icon

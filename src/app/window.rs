@@ -1,20 +1,23 @@
 //! Main application window for Featherweight.
 //!
-//! [`FeatherweightApp`] is the top-level egui application. The idle view is a
-//! two-column grid of settings cards built from the widget primitives in
-//! [`crate::app::widgets`]. All persistent state lives in [`AppConfig`]; the
-//! window calls `config.save()` after every user change.
+//! [`FeatherweightApp`] is the top-level egui application. A tab strip
+//! switches between three views: a live recording monitor (the landing
+//! view), the two-column settings grid built from the widget primitives in
+//! [`crate::app::widgets`], and the About view with its license texts. All
+//! persistent state lives in [`AppConfig`]; the window calls `config.save()`
+//! after every user change.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::Ordering};
 
 use eframe::egui::{
-    self, Align, Button, Color32, ComboBox, Key, RichText, ScrollArea, Stroke,
+    self, Align, Button, Color32, ComboBox, Image, Key, RichText, ScrollArea, Stroke, Vec2,
 };
 
 use crate::{
     app::{
         session::{SessionShared, SessionStats, StopReason},
-        theme::{AMBER, BG, MUTED, RED, TEXT},
+        theme::{AMBER, BG, BORDER, MUTED, RED, TEXT},
         widgets::{
             self, CONTROL_HEIGHT, VALUE_WIDTH,
             integer_slider, row, section_title, settings_card, stat_chip,
@@ -79,6 +82,17 @@ impl RebindSlot {
     }
 }
 
+/// Top-level views, selectable from the tab strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// Live session monitor; the landing view.
+    Recording,
+    /// The two-column settings grid.
+    Settings,
+    /// App identity and third-party licenses.
+    About,
+}
+
 pub struct FeatherweightApp {
     /// System tray icon and menu (main-thread-bound; visuals are synced
     /// from the shared session status each frame).
@@ -121,6 +135,25 @@ pub struct FeatherweightApp {
     /// Transient message for the shortcuts card: guidance, or the outcome of
     /// the last rebind. The `bool` selects error styling.
     rebind_note: Option<(String, bool)>,
+    /// Which view the central panel shows. Recording is the landing view so
+    /// a fresh open answers "is it recording, and what is it doing".
+    view: View,
+    /// Whether the previous frame saw an active session. The Idle→active
+    /// edge (a tray or hotkey start while the window is visible) lands on
+    /// the Recording view.
+    was_active: bool,
+    /// The Recording view's still of the session's first frame.
+    thumb: Option<egui::TextureHandle>,
+    /// The session output path `thumb` belongs to: guards against showing a
+    /// previous session's still while the current one has not produced its
+    /// first frame yet, and lets the finished session's still linger on the
+    /// idle card.
+    thumb_for: Option<PathBuf>,
+    /// Capture resolution recorded inside the thumbnail PNG; the true video
+    /// size, which the downscaled still itself no longer shows.
+    thumb_resolution: Option<(u32, u32)>,
+    /// About view state (the app icon texture).
+    about: crate::app::about::AboutView,
 }
 
 impl FeatherweightApp {
@@ -185,6 +218,12 @@ impl FeatherweightApp {
             preview_signature: (false, false),
             rebinding: None,
             rebind_note: None,
+            view: View::Recording,
+            was_active: false,
+            thumb: None,
+            thumb_for: None,
+            thumb_resolution: None,
+            about: crate::app::about::AboutView::new(),
         }
     }
 
@@ -232,6 +271,8 @@ impl FeatherweightApp {
     /// [`crate::app::session::SessionShared::start_recording`]).
     fn start_recording(&mut self) {
         self.shared.start_recording(self.config.clone());
+        // The user just asked to record: land on the live monitor.
+        self.view = View::Recording;
     }
 
     /// Requests the running session to stop. Every stop path reports a reason,
@@ -331,10 +372,14 @@ impl FeatherweightApp {
     }
 
     // -----------------------------------------------------------------------
-    // Idle view — the full two-column settings grid
+    // Recording view — live session monitor (landing view)
     // -----------------------------------------------------------------------
 
-    fn render_idle(&mut self, ui: &mut egui::Ui) {
+    /// The live monitor: the session state at a glance, with the first
+    /// captured frame as a still. Everything here is mirrored from the hub,
+    /// which the pump updates once per second — including while this window
+    /// is hidden, which is why the window is not the sampler.
+    fn render_recording(&mut self, ui: &mut egui::Ui) {
         // ---------------------------------------------------------------------------
         // Session state and its live numbers. Both are mirrored from the hub,
         // which the pump updates once per second — including while this window
@@ -357,15 +402,8 @@ impl FeatherweightApp {
             self.disk_free = crate::disk::free_bytes_for_path(&self.config.output_dir);
             self.last_disk_check = now;
         }
-        // Schedule a repaint in 1 s so the readout stays live even when no
-        // recorder events are arriving (idle) or one is missed (recording).
-        // With a preview running the meters need ~20 Hz instead.
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_secs(1));
-        if self.audio_preview.is_some() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
-        }
+        // (Repaint scheduling lives in `fn ui`, so it applies to every
+        // view, not just this one.)
 
         let hard_floor = crate::disk::hard_floor();
         let free = if recording { stats.free_bytes } else { self.disk_free };
@@ -425,40 +463,7 @@ impl FeatherweightApp {
         // -------------------------------------------------------------------
         match status {
             SessionStatus::Recording { path, elapsed_secs } => {
-                ui.horizontal(|ui| {
-                    let frame = egui::Frame::new()
-                        .fill(Color32::from_rgb(70, 12, 16))
-                        .stroke(Stroke::new(1.0, RED))
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .inner_margin(egui::Margin::symmetric(10, 6));
-                    frame.show(ui, |ui| {
-                        ui.label(RichText::new("●").color(RED).size(14.0));
-                        ui.label(
-                            RichText::new(format!(
-                                "Recording {}",
-                                crate::tray::format_duration(elapsed_secs)
-                            ))
-                            .monospace()
-                            .color(TEXT),
-                        );
-                    });
-                    // Size and measured growth. The destination path lives in
-                    // the hover text now: the numbers are the interesting part
-                    // while a recording is running.
-                    stat_chip(
-                        ui,
-                        &stats_readout(&stats),
-                        MUTED,
-                        Color32::from_rgb(26, 29, 35),
-                    )
-                    .on_hover_text(path.to_string_lossy().as_ref());
-                    if ui
-                        .add_sized([110.0, CONTROL_HEIGHT], Button::new("Stop"))
-                        .clicked()
-                    {
-                        self.stop_recording();
-                    }
-                });
+                self.render_recording_active(ui, &stats, &path, elapsed_secs);
             }
             SessionStatus::WaitingForFirstFrame { target } => {
                 ui.horizontal(|ui| {
@@ -488,6 +493,15 @@ impl FeatherweightApp {
                         self.stop_recording();
                     }
                 });
+                ui.add_space(8.0);
+                // Placeholder until the target's first frame lands.
+                draw_still(
+                    ui,
+                    None,
+                    &format!("Waiting for {target}…"),
+                    "The still appears once the target delivers its first frame — a \
+                     minimized window delivers none until restored.",
+                );
             }
             SessionStatus::Idle => {
                 let simulated = std::env::var("FEATHERWEIGHT_SIMULATE")
@@ -502,14 +516,73 @@ impl FeatherweightApp {
                     }
                     ui.label(
                         RichText::new(if simulated {
-                            "Simulated session — no frames are captured."
+                            "No recording running. Simulated sessions capture no frames."
                         } else {
-                            "Recording uses the settings below and captures the chosen monitor or window."
+                            "No recording running. Record uses the settings on the Settings tab."
                         })
                         .size(12.0)
                         .color(MUTED),
                     );
                 });
+
+                // The finished session's still lingers as a dimmed card.
+                if let (Some(last_thumb), Some(last_path)) =
+                    (self.thumb.clone(), self.thumb_for.clone())
+                {
+                    ui.add_space(10.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(24, 28, 34))
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("Last recording")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(MUTED),
+                                    );
+                                    let dir = last_path
+                                        .parent()
+                                        .map(Path::to_string_lossy)
+                                        .unwrap_or_default();
+                                    ui.label(
+                                        RichText::new(widgets::ellipsis(&dir, 44))
+                                            .size(11.0)
+                                            .color(MUTED),
+                                    )
+                                    .on_hover_text(dir.as_ref());
+                                    if ui
+                                        .add_sized(
+                                            [110.0, CONTROL_HEIGHT],
+                                            Button::new("Open folder"),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Err(e) = crate::tray::menu::open_folder(
+                                            last_path.parent().unwrap_or(Path::new(&last_path)),
+                                        ) {
+                                            self.warning = Some(e);
+                                        }
+                                    }
+                                });
+                                // Dimmed still, right-aligned.
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    let [tex_w, tex_h] = last_thumb.size();
+                                    let aspect = tex_w.max(1) as f32 / tex_h.max(1) as f32;
+                                    let width = 150.0;
+                                    ui.add(
+                                        Image::new(&last_thumb)
+                                            .fit_to_exact_size(Vec2::new(width, width / aspect))
+                                            .corner_radius(6.0)
+                                            .tint(Color32::from_rgb(150, 155, 165)),
+                                    );
+                                });
+                            });
+                        });
+                }
             }
         }
         ui.add_space(6.0);
@@ -578,13 +651,9 @@ impl FeatherweightApp {
             }
         }
 
-        // Config-save / startup warnings (dismissible)
-        if let Some(warning) = self.warning.clone() {
-            if warning_box(ui, &warning) {
-                self.warning = None;
-            }
-            ui.add_space(6.0);
-        }
+        // Config-save / startup warnings (dismissible). Rendered on the
+        // Settings view too, so save or preview errors stay visible.
+        self.render_warning_bar(ui);
 
         // First-run hint: where the app went, and how to pin the tray icon.
         if let Some(hint) = self.hint.clone() {
@@ -593,6 +662,208 @@ impl FeatherweightApp {
             }
             ui.add_space(6.0);
         }
+    }
+
+    /// The monitor card shown while a session records: the first captured
+    /// frame as a still on the left, the live readouts on the right.
+    fn render_recording_active(
+        &mut self,
+        ui: &mut egui::Ui,
+        stats: &SessionStats,
+        path: &Path,
+        elapsed_secs: u64,
+    ) {
+        // Load (or wait for) this session's still; until it arrives the
+        // placeholder explains why. In simulated mode no frames are ever
+        // captured, so say that instead of implying the still is merely slow.
+        let simulated = std::env::var("FEATHERWEIGHT_SIMULATE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let (pending_title, pending_detail) = if simulated {
+            (
+                "No still in simulated mode",
+                "Simulated sessions capture no frames, so there is no still to show.",
+            )
+        } else {
+            (
+                "First frame pending…",
+                "The still appears after the first captured frame.",
+            )
+        };
+        self.sync_thumbnail(ui.ctx(), Some(path));
+        let thumb_ready = self.thumb_for.as_deref() == Some(path);
+        let thumb = if thumb_ready {
+            self.thumb.clone()
+        } else {
+            None
+        };
+        let resolution = if thumb_ready {
+            self.thumb_resolution
+        } else {
+            None
+        };
+
+        ui.horizontal(|ui| {
+            // Left: the still, sized to fit what is left of the window.
+            let left_w = (ui.available_width() * 0.45).clamp(180.0, 420.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(left_w, ui.available_height().max(140.0)),
+                egui::Layout::top_down(Align::Center),
+                |ui| {
+                    draw_still(
+                        ui,
+                        thumb.as_ref(),
+                        pending_title,
+                        pending_detail,
+                    );
+                },
+            );
+
+            // Right: live readouts.
+            ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
+                let frame = egui::Frame::new()
+                    .fill(Color32::from_rgb(70, 12, 16))
+                    .stroke(Stroke::new(1.0, RED))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 6));
+                frame.show(ui, |ui| {
+                    ui.label(RichText::new("●").color(RED).size(14.0));
+                    ui.label(
+                        RichText::new(format!(
+                            "Recording {}",
+                            crate::tray::format_duration(elapsed_secs)
+                        ))
+                        .monospace()
+                        .color(TEXT),
+                    );
+                });
+
+                // What is being captured, as named at session start (the
+                // picker can change mid-session without rewriting this).
+                if let Some(target) = &stats.target_title {
+                    ui.label(
+                        RichText::new(widgets::ellipsis(target, 64))
+                            .size(14.0)
+                            .strong()
+                            .color(TEXT),
+                    )
+                    .on_hover_text(target);
+                }
+
+                // Size · rate · RAM, plus the capture resolution once known.
+                ui.horizontal(|ui| {
+                    stat_chip(
+                        ui,
+                        &stats_readout(stats),
+                        MUTED,
+                        Color32::from_rgb(26, 29, 35),
+                    );
+                    if let Some((width, height)) = resolution {
+                        stat_chip(
+                            ui,
+                            &format!("{width}×{height}"),
+                            MUTED,
+                            Color32::from_rgb(26, 29, 35),
+                        );
+                    }
+                });
+
+                // Destination (hover = full path), Open folder, Stop.
+                ui.horizontal(|ui| {
+                    let path_text = path.to_string_lossy();
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(widgets::ellipsis(&path_text, 48))
+                                .size(12.0)
+                                .color(MUTED),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(path_text.as_ref());
+                    if ui
+                        .add_sized([110.0, CONTROL_HEIGHT], Button::new("Open folder"))
+                        .clicked()
+                    {
+                        let dir = path.parent().unwrap_or(path).to_path_buf();
+                        if let Err(e) = crate::tray::menu::open_folder(&dir) {
+                            self.warning = Some(e);
+                        }
+                    }
+                    if ui
+                        .add_sized([90.0, CONTROL_HEIGHT], Button::new("Stop"))
+                        .clicked()
+                    {
+                        self.stop_recording();
+                    }
+                });
+            });
+        });
+    }
+
+    /// Loads the first-frame still for `session_path` when it is not the one
+    /// already loaded.
+    ///
+    /// While a session runs and its still has not landed (the pipeline
+    /// writes it on the first captured frame), this re-reads on a 200 ms
+    /// repaint cadence until it does. On load it also picks up the capture
+    /// resolution recorded inside the PNG.
+    fn sync_thumbnail(&mut self, ctx: &egui::Context, session_path: Option<&Path>) {
+        let Some(session_path) = session_path else {
+            return;
+        };
+        if self.thumb_for.as_deref() == Some(session_path) {
+            return; // this session's still is already loaded
+        }
+        let loaded = (|| -> Option<(egui::TextureHandle, Option<(u32, u32)>)> {
+            let png_path = crate::capture::pipeline::first_frame_png_path()?;
+            let bytes = std::fs::read(&png_path).ok()?;
+            let (rgba, width, height) = crate::app::theme::decode_png_rgba(&bytes)?;
+            let texture = ctx.load_texture(
+                "first-frame",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                ),
+                egui::TextureOptions::LINEAR,
+            );
+            let resolution = crate::capture::pipeline::first_frame_source_resolution();
+            Some((texture, resolution))
+        })();
+        match loaded {
+            Some((texture, resolution)) => {
+                self.thumb = Some(texture);
+                self.thumb_resolution = resolution;
+                self.thumb_for = Some(session_path.to_path_buf());
+            }
+            None => {
+                // The still has not landed yet; try again shortly.
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
+    /// The dismissible warning bar (config-save problems, audio-preview
+    /// failures). Rendered on the Recording and Settings views alike so a
+    /// warning raised while the settings grid is open stays visible.
+    fn render_warning_bar(&mut self, ui: &mut egui::Ui) {
+        if let Some(warning) = self.warning.clone() {
+            if warning_box(ui, &warning) {
+                self.warning = None;
+            }
+            ui.add_space(6.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings view — the full two-column settings grid
+    // -----------------------------------------------------------------------
+
+    /// The two-column settings grid (the app's old single view), kept
+    /// unchanged apart from what moved to the Recording view.
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        // Config-save warnings are mostly raised by interactions on this
+        // very view, so it renders the dismissible warning bar as well.
+        self.render_warning_bar(ui);
 
         // Scrollable settings area
         ScrollArea::vertical()
@@ -1134,6 +1405,58 @@ fn stats_readout(stats: &SessionStats) -> String {
     }
 }
 
+/// Draws the first-frame still fit into the available space preserving its
+/// aspect ratio, or a bordered placeholder explaining why there is nothing
+/// to show yet.
+fn draw_still(
+    ui: &mut egui::Ui,
+    thumb: Option<&egui::TextureHandle>,
+    placeholder_title: &str,
+    placeholder_detail: &str,
+) {
+    let Some(texture) = thumb else {
+        // Placeholder sized like a 16:9 still.
+        let width = ui.available_width();
+        let height = (width * 9.0 / 16.0)
+            .min((ui.available_height() - 4.0).max(90.0))
+            .max(90.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(24, 28, 34))
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_size(Vec2::new(width, height));
+                ui.vertical_centered(|ui| {
+                    ui.add_space((height * 0.3).min(60.0));
+                    ui.label(RichText::new(placeholder_title).size(14.0).color(MUTED));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(placeholder_detail)
+                            .size(11.5)
+                            .color(MUTED),
+                    );
+                });
+            });
+        return;
+    };
+
+    // Fit within the available space, preserving the aspect ratio.
+    let [tex_w, tex_h] = texture.size();
+    let aspect = tex_w.max(1) as f32 / tex_h.max(1) as f32;
+    let max_w = ui.available_width();
+    let max_h = (ui.available_height() - 4.0).max(90.0);
+    let mut size = Vec2::new(max_w, max_w / aspect);
+    if size.y > max_h {
+        size = Vec2::new(max_h * aspect, max_h);
+    }
+    ui.add(
+        Image::new(texture)
+            .fit_to_exact_size(size)
+            .corner_radius(6.0),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // eframe::App impl
 // ---------------------------------------------------------------------------
@@ -1224,6 +1547,68 @@ impl eframe::App for FeatherweightApp {
         // status line). Cheap no-op unless something changed.
         self.tray.sync_session();
 
+        // Keep every view live: 1 s cadence for the readouts, ~20 Hz while
+        // the idle audio meters run. Lives here — not in a view — so it
+        // applies to all views.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
+        if self.audio_preview.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // While a session runs, the Recording tab carries a red ● and the
+        // live elapsed time; and an Idle→active edge from a tray or hotkey
+        // start (while the window is visible) lands on the Recording view.
+        // A hidden window runs no frames, so this only fires when the user
+        // can see it.
+        let status = self.shared.status.lock().unwrap().clone();
+        let active = !matches!(status, SessionStatus::Idle);
+        if active && !self.was_active {
+            self.view = View::Recording;
+        }
+        self.was_active = active;
+
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::new()
+                    .fill(BG)
+                    .inner_margin(egui::Margin::symmetric(20, 8)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (view, label) in [
+                        (View::Recording, "Recording"),
+                        (View::Settings, "Settings"),
+                        (View::About, "About"),
+                    ] {
+                        let selected = self.view == view;
+                        let text = if view == View::Recording {
+                            match &status {
+                                SessionStatus::Recording { elapsed_secs, .. } => RichText::new(
+                                    format!(
+                                        "● Recording {}",
+                                        crate::tray::format_duration(*elapsed_secs)
+                                    ),
+                                )
+                                .color(RED),
+                                _ => {
+                                    RichText::new(label).color(if selected { TEXT } else { MUTED })
+                                }
+                            }
+                        } else {
+                            RichText::new(label).color(if selected { TEXT } else { MUTED })
+                        };
+                        if ui
+                            .add(Button::new(text.size(13.0)).selected(selected))
+                            .clicked()
+                        {
+                            self.view = view;
+                        }
+                    }
+                });
+            });
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1231,7 +1616,11 @@ impl eframe::App for FeatherweightApp {
                     .inner_margin(egui::Margin::symmetric(20, 16)),
             )
             .show(ui, |ui| {
-                self.render_idle(ui);
+                match self.view {
+                    View::Recording => self.render_recording(ui),
+                    View::Settings => self.render_settings(ui),
+                    View::About => self.about.render(ui),
+                }
             });
 
         // Save config if anything changed, and mirror it into the shared

@@ -28,6 +28,7 @@
 //! if the user edits them mid-recording.
 
 use std::{
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -126,6 +127,14 @@ pub struct SessionStats {
     /// Physical RAM the whole process is using (its working set), sampled
     /// once per tick; `None` when the OS query failed.
     pub ram_bytes: Option<u64>,
+    /// Human label of what is being captured (window title or monitor label).
+    /// Set when the session starts and kept for the session's lifetime, so the
+    /// Recording view still names the target after the picker changes.
+    pub target_title: Option<String>,
+    /// Destination file of the active session. Holds the *final* path (not the
+    /// separate-track staging file the encoder writes), which is what the UI
+    /// shows and what Open folder opens.
+    pub output_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,10 +292,24 @@ pub fn spawn_pump(rx: Receiver<RecorderEvent>, shared: Arc<SessionShared>, sessi
                 match event {
                     RecorderEvent::Waiting { target } => {
                         *shared.status.lock().unwrap() =
-                            SessionStatus::WaitingForFirstFrame { target };
+                            SessionStatus::WaitingForFirstFrame {
+                                target: target.clone(),
+                            };
+                        {
+                            // No output file exists yet while waiting; the
+                            // path arrives with Started.
+                            let mut stats = shared.stats.lock().unwrap();
+                            stats.target_title = Some(target);
+                            stats.output_path = None;
+                        }
                         shared.egui.request_repaint();
                     }
-                    RecorderEvent::Started(path) => {
+                    RecorderEvent::Started { path, target } => {
+                        {
+                            let mut stats = shared.stats.lock().unwrap();
+                            stats.target_title = Some(target);
+                            stats.output_path = Some(path.clone());
+                        }
                         *shared.status.lock().unwrap() = SessionStatus::Recording {
                             path,
                             elapsed_secs: 0,
@@ -322,7 +345,15 @@ pub fn spawn_pump(rx: Receiver<RecorderEvent>, shared: Arc<SessionShared>, sessi
                         // disk sample; the readout never needs this fresher.
                         stats.ram_bytes = mem::process_working_set();
                         let disk_critical = stats.disk_critical;
-                        *shared.stats.lock().unwrap() = stats;
+                        {
+                            // The stats are rebuilt from the tick's inputs;
+                            // carry over the session identity the Progress
+                            // event does not repeat.
+                            let mut current = shared.stats.lock().unwrap();
+                            stats.target_title = current.target_title.clone();
+                            stats.output_path = current.output_path.clone();
+                            *current = stats;
+                        }
 
                         note_duration_limit(&shared, elapsed_secs, duration_secs);
 
@@ -425,6 +456,10 @@ fn compose_stats(
         // Sampled by the pump right after this returns (it is an OS query,
         // not a pure input, so it stays out of the testable signature).
         ram_bytes: None,
+        // Session identity is attached by the pump (it comes from the event,
+        // not from the tick's numbers); cleared with the rest on finish.
+        target_title: None,
+        output_path: None,
     }
 }
 
@@ -656,6 +691,12 @@ mod tests {
         assert!(stats.free_bytes.is_some(), "free space was not sampled");
         assert!(stats.eta_secs.is_some(), "no ETA with a rate and free space");
         assert!(!stats.disk_critical);
+        // Session identity comes through the Started event and survives the
+        // once-per-second stats rebuild above.
+        let target = stats.target_title.as_deref().expect("target title");
+        assert!(!target.is_empty(), "target title was empty");
+        let output = stats.output_path.as_ref().expect("output path");
+        assert_eq!(output.extension().and_then(|e| e.to_str()), Some("mp4"));
 
         // A user stop is recorded and clears the live state.
         shared.request_stop(StopReason::User);

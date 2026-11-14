@@ -78,8 +78,16 @@ pub enum RecorderEvent {
     },
 
     /// The recorder has opened the output file and begun writing frames.
-    /// The path is the final destination of the recording.
-    Started(PathBuf),
+    /// The path is the final destination of the recording; `target` is the
+    /// human label of what is being captured (window title or monitor label),
+    /// resolved once at session start so the readout stays correct even if the
+    /// picker selection changes mid-session.
+    Started {
+        /// Destination file of the recording.
+        path: PathBuf,
+        /// Human label of the capture target (window title or monitor label).
+        target: String,
+    },
 
     /// Periodic tick with the elapsed recording time and the current size of
     /// the file being written. Emitted roughly once per second so the UI and
@@ -315,20 +323,26 @@ fn worker(
 
     log::log(&format!("recording to {}", output_path.display()));
 
+    // A thumbnail from the previous session must not be mistaken for this
+    // one while the pipeline is still waiting for its first frame.
+    pipeline::clear_first_frame_thumbnail();
+
     // Window targets can sit waiting for their first frame (a minimized or
     // fully static window delivers none); monitors deliver one within
     // milliseconds, so they start immediately.
-    let wait_target = match config.capture_target {
-        CaptureTarget::Window { title, .. } => Some(title),
-        CaptureTarget::Monitor { .. } => None,
-    };
+    let label = target_label(&config);
+    let wait_target = matches!(&config.capture_target, CaptureTarget::Window { .. })
+        .then(|| label.clone());
     if let Some(target) = &wait_target {
         let _ = tx.send(RecorderEvent::Waiting {
             target: target.clone(),
         });
         wake();
     } else {
-        let _ = tx.send(RecorderEvent::Started(output_path.clone()));
+        let _ = tx.send(RecorderEvent::Started {
+            path: output_path.clone(),
+            target: label.clone(),
+        });
         wake();
     }
 
@@ -372,7 +386,10 @@ fn worker(
                 } else {
                     None
                 };
-                let _ = tx.send(RecorderEvent::Started(output_path.clone()));
+                let _ = tx.send(RecorderEvent::Started {
+                    path: output_path.clone(),
+                    target: label.clone(),
+                });
                 wake();
             }
             continue;
@@ -442,6 +459,11 @@ fn simulated_worker(
 
     log::log(&format!("[simulated] recording to {}", output_path.display()));
 
+    // The simulated worker writes no frames, so any thumbnail left by a real
+    // session must be removed; the UI then shows its placeholder instead of a
+    // stale image.
+    pipeline::clear_first_frame_thumbnail();
+
     // Create the (empty) file so path collisions behave like a real recording,
     // and keep the handle open like the encoder does.
     let mut output = match std::fs::OpenOptions::new()
@@ -461,7 +483,10 @@ fn simulated_worker(
         }
     };
 
-    let _ = tx.send(RecorderEvent::Started(output_path.clone()));
+    let _ = tx.send(RecorderEvent::Started {
+        path: output_path.clone(),
+        target: target_label(&config),
+    });
     wake();
 
     // Optional deadline (0 = unlimited), same rule as the real worker.
@@ -554,6 +579,30 @@ fn write_repeated(file: &mut std::fs::File, chunk: &[u8], total: u64) -> std::io
 // ---------------------------------------------------------------------------
 // Output path helpers
 // ---------------------------------------------------------------------------
+
+/// Human label for the configured capture target: the window's title, or the
+/// monitor's label from the picker's enumeration (falling back to its index).
+///
+/// Resolved once per session at start time so later picker changes cannot
+/// rewrite what a running recording claims to capture.
+fn target_label(config: &AppConfig) -> String {
+    match &config.capture_target {
+        CaptureTarget::Window { title, .. } => {
+            if title.is_empty() {
+                "Application window".to_owned()
+            } else {
+                title.clone()
+            }
+        }
+        CaptureTarget::Monitor { index } => {
+            crate::capture::monitors::enumerate_monitors()
+                .into_iter()
+                .find(|monitor| monitor.index == *index)
+                .map(|monitor| monitor.label)
+                .unwrap_or_else(|| format!("Monitor {index}"))
+        }
+    }
+}
 
 /// Builds a unique output file path from the config's directory and filename
 /// template, appending `_1`, `_2`, … if the base name is taken.

@@ -1,7 +1,7 @@
 use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
 use eframe::{Renderer, UserEvent, WgpuConfiguration};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::raw_window_handle::HasWindowHandle;
 
@@ -9,6 +9,8 @@ use crate::capture::recorder::{RecorderManager, SessionStatus};
 use crate::config::AppConfig;
 use crate::log;
 
+pub mod about;
+pub mod recordings;
 pub mod session;
 pub mod theme;
 pub mod widgets;
@@ -22,11 +24,11 @@ pub mod shutdown;
 #[cfg(windows)]
 pub mod single_instance;
 
-const APP_NAME: &str = "Featherweight";
+const APP_NAME: &str = "Geliana Featherweight";
 
 pub fn run() -> eframe::Result {
     log::log_init();
-    log::log("Initializing Featherweight");
+    log::log(&format!("Initializing {APP_NAME}"));
 
     // Single-instance protection: when an instance is already running, a
     // second launch must not start — it surfaces the running instance's
@@ -36,7 +38,7 @@ pub fn run() -> eframe::Result {
     match single_instance::acquire() {
         single_instance::Acquisition::Acquired => {}
         single_instance::Acquisition::AlreadyRunning => {
-            log::log("another Featherweight instance is running; surfacing it and exiting");
+            log::log(&format!("another {APP_NAME} instance is running; surfacing it and exiting"));
             single_instance::signal_previous();
             return Ok(());
         }
@@ -104,9 +106,9 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
     }
 
     let hint = first_run.then(|| {
-        "Featherweight runs in the notification area. Click ^ next to the clock, then drag the \
-         feather icon onto the taskbar to pin it. (Start hidden can be turned off in this window.)"
-            .to_owned()
+        format!("{APP_NAME} runs in the notification area. Click ^ next to the clock, then drag \
+                 the feather icon onto the taskbar to pin it. (Start hidden can be turned off in \
+                 this window.)")
     });
 
     log::log(&format!(
@@ -175,6 +177,7 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
                 // the saved preferences before the window's first frame.
                 config: Mutex::new(config.clone()),
                 recorder: Mutex::new(RecorderManager::default()),
+                hotkeys: Arc::new(crate::hotkeys::HotkeyController::new(config.shortcuts)),
                 show_requested: AtomicBool::new(false),
             });
             *hub_for_closure.lock().unwrap() = Some(shared.clone());
@@ -202,6 +205,37 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
                 crate::app::single_instance::spawn_show_listener(main_hwnd, shared.clone());
             }
 
+            // Global hotkeys: the polling thread watches the keyboard every
+            // 8 ms and sends events; the consumer thread below turns them
+            // into hub actions. Start/stop must work while the window is
+            // hidden — and no egui frames run while it is hidden — so the
+            // events deliberately do not go through the window's frame
+            // handler.
+            {
+                // The poller sets the shared stop flag directly on the stop
+                // hotkey (lowest latency; it does not wait for a repaint).
+                shared.hotkeys.set_stop_signal(shared.stop_flag.clone());
+                let (tx, rx) = std::sync::mpsc::channel::<crate::hotkeys::HotkeyEvent>();
+                let egui = shared.egui.clone();
+                match crate::hotkeys::spawn(tx, shared.hotkeys.clone(), move || {
+                    egui.request_repaint()
+                }) {
+                    Ok(_) => {
+                        let consumer = shared.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("hotkey-actions".into())
+                            .spawn(move || {
+                                for event in rx {
+                                    apply_hotkey_event(&consumer, event);
+                                }
+                            });
+                    }
+                    Err(error) => {
+                        crate::log::log(&format!("could not start hotkey polling: {error}"))
+                    }
+                }
+            }
+
             // Tray::new installs its own click/menu handlers (Windows) using
             // the window handle and egui context from `cc`.
             let tray = crate::tray::Tray::new(cc, shared.clone())?;
@@ -214,7 +248,7 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
         &event_loop,
     );
 
-    log::log("Starting Featherweight event loop");
+    log::log(&format!("Starting {APP_NAME} event loop"));
 
     let run_result = event_loop.run_app(&mut app);
 
@@ -228,6 +262,55 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
     }
 
     run_result.map_err(eframe::Error::WinitEventLoop)
+}
+
+/// Turns a hotkey event into a hub action, with no UI involvement.
+///
+/// Runs on the `hotkey-actions` consumer thread (spawned by `try_run`), not
+/// the window: hotkeys must work while the window is hidden, and no egui
+/// frames run while it is hidden, so an event routed through the window's
+/// frame handler would never be seen.
+pub(crate) fn apply_hotkey_event(
+    shared: &Arc<session::SessionShared>,
+    event: crate::hotkeys::HotkeyEvent,
+) {
+    use crate::hotkeys::HotkeyEvent;
+
+    match event {
+        HotkeyEvent::Start => {
+            // The hub's config snapshot is what the tray's "New recording"
+            // uses, so a hotkey start honors exactly the same preferences —
+            // including changes made from the tray while the window was
+            // hidden.
+            let config = shared.config.lock().unwrap().clone();
+            if shared.start_recording(config) {
+                crate::log::log("hotkey: recording started");
+                shared.egui.request_repaint();
+            }
+        }
+        HotkeyEvent::Stop => {
+            let idle = matches!(*shared.status.lock().unwrap(), SessionStatus::Idle);
+            if idle {
+                // Stray stop with no session running: the poller set the
+                // shared stop flag directly for latency, and `finish` (which
+                // re-arms the flag) never runs for a session that never was.
+                // Re-arm it here, or the next session would stop the instant
+                // it starts.
+                shared.stop_flag.store(false, Ordering::Release);
+            } else {
+                // Explain the stop like a manual one — but never clobber a
+                // real reason an automatic guard (disk, duration) may have
+                // recorded first.
+                let mut reason = shared.stop_reason.lock().unwrap();
+                if reason.is_none() {
+                    *reason = Some(session::StopReason::User);
+                }
+            }
+        }
+        HotkeyEvent::Availability { start, stop } => {
+            crate::log::log(&format!("hotkeys active: start={start} stop={stop}"));
+        }
+    }
 }
 
 /// Whether the window is shown when the app starts.

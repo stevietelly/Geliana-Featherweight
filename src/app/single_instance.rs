@@ -36,8 +36,8 @@ use windows::Win32::System::Memory::{
     FILE_MAP_WRITE, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, GetCurrentProcessId, OpenEventW, SetEvent, WaitForSingleObject,
-    EVENT_MODIFY_STATE, INFINITE,
+    CreateEventW, CreateMutexW, GetCurrentProcessId, OpenEventW, OpenMutexW, SetEvent,
+    WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, SYNCHRONIZATION_SYNCHRONIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -203,6 +203,7 @@ mod tests {
     use crate::capture::recorder::{RecorderManager, SessionStatus};
     use eframe::egui::Context;
     use std::sync::Mutex as Mutex;
+    use crate::hotkeys::HotkeyController;
 
     // The kernel objects are process-global: this module's tests must not run
     // concurrently with each other, so they are serialized through this lock
@@ -233,6 +234,7 @@ mod tests {
             prefs_dirty: std::sync::atomic::AtomicBool::new(false),
             config: Mutex::new(crate::config::AppConfig::default()),
             recorder: Mutex::new(RecorderManager::default()),
+            hotkeys: Arc::new(HotkeyController::new(crate::hotkeys::Shortcuts::default())),
             show_requested: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -243,6 +245,20 @@ mod tests {
     #[test]
     fn second_acquire_signals_the_running_instance() {
         let _guard = SINGLE_INSTANCE_LOCK.lock().unwrap();
+
+        // A real Featherweight instance running on this machine holds the
+        // exact named mutex this test must claim; skip rather than fail —
+        // the same environment-dependent skip the disk-bound session tests
+        // use. The object only exists while a process keeps a handle open,
+        // and no test process outlives its run, so "exists" means "the app
+        // is running".
+        let mutex_name = HSTRING::from(format!("{MUTEX_NAME}{GUID}"));
+        if unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &mutex_name) }.is_ok() {
+            eprintln!(
+                "skipping: a Featherweight instance is running and holds the instance mutex"
+            );
+            return;
+        }
 
         // First launch in this (test) process claims ownership.
         match acquire() {

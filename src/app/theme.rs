@@ -18,13 +18,16 @@ pub(crate) const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
 pub(crate) const MUTED: Color32 = Color32::from_rgb(130, 138, 155);
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(10, 115, 235);
 pub(crate) const RED: Color32 = Color32::from_rgb(220, 48, 56);
+pub(crate) const WHITE: Color32 = Color32::from_rgb(255, 255, 255);
 pub(crate) const AMBER: Color32 = Color32::from_rgb(220, 165, 0);
 pub(crate) const GREEN: Color32 = Color32::from_rgb(48, 210, 111);
 pub(crate) const METER_BG: Color32 = Color32::from_rgb(20, 24, 30);
 pub(crate) const LABEL_WIDTH: f32 = 120.0;
 pub(crate) const CONTROL_HEIGHT: f32 = 28.0;
 
-const APP_ICON: &[u8] = include_bytes!("../assets/Featherweight_App_Icon_256.png");
+/// The 256 px application icon, embedded so both the window/taskbar icon and
+/// the About view can share one decoded source.
+pub(crate) const APP_ICON: &[u8] = include_bytes!("../assets/Featherweight_App_Icon_256.png");
 
 // ---------------------------------------------------------------------------
 // Window icon

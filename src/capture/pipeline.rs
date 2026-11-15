@@ -68,6 +68,10 @@ struct WgcFlags {
     audio: Option<AudioPipeline>,
     mic_pcm_path: Option<PathBuf>,
     finalization_error: Arc<Mutex<Option<String>>>,
+    /// Destination of the first-frame still shown by the Recording view.
+    /// `None` when the local app-data directory is unavailable; the session
+    /// then records normally without a thumbnail.
+    thumbnail: Option<PathBuf>,
     /// Set once the first WGC frame has sized and created the encoder. The
     /// recorder polls it to move the session out of `WaitingForFirstFrame`,
     /// and the audio sinks gate on it so every track shares the video's
@@ -94,6 +98,9 @@ struct WgcCapture {
     last_frame: Option<Instant>,
     /// Logs the first size mismatch once per recording, not per frame.
     letterbox_warned: bool,
+    /// First-frame thumbnail destination; taken once the PNG is written so a
+    /// mid-recording resize cannot overwrite it.
+    thumbnail: Option<PathBuf>,
 }
 
 impl GraphicsCaptureApiHandler for WgcCapture {
@@ -201,6 +208,7 @@ impl GraphicsCaptureApiHandler for WgcCapture {
             frame_interval,
             last_frame: None,
             letterbox_warned: false,
+            thumbnail: ctx.flags.thumbnail.take(),
         })
     }
 
@@ -256,6 +264,12 @@ impl GraphicsCaptureApiHandler for WgcCapture {
                 Ok(encoder) => {
                     self.target = Some((width, height));
                     *self.encoder.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoder);
+                    // Grab the still before `first_frame` is published: the
+                    // recorder's Started event (and therefore the UI's
+                    // thumbnail load) only fires after this flag flips.
+                    if let Some(path) = self.thumbnail.take() {
+                        save_wgc_thumbnail(frame, &path);
+                    }
                     self.first_frame.store(true, Ordering::Release);
                 }
                 Err(e) => {
@@ -776,6 +790,10 @@ pub fn start_recording(
             (output_path.clone(), None, None)
         };
 
+    // Per-session still for the Recording view. Written from the first frame
+    // in either pipeline; failure is logged once and never fails the session.
+    let thumbnail = first_frame_png_path();
+
     let source = CaptureSource::resolve(config)?;
 
     // If force_gdi is false, probe Windows Graphics Capture (WGC). For window
@@ -823,6 +841,7 @@ pub fn start_recording(
                     audio: start_audio_pipeline(config, &stop_signal, "WGC", mic_muted),
                     mic_pcm_path: mic_pcm_path.clone(),
                     finalization_error: finalization_error.clone(),
+                    thumbnail: thumbnail.clone(),
                     first_frame: first_frame.clone(),
                 };
                 let settings = Settings::new(
@@ -846,6 +865,7 @@ pub fn start_recording(
                     audio: start_audio_pipeline(config, &stop_signal, "WGC", mic_muted),
                     mic_pcm_path: mic_pcm_path.clone(),
                     finalization_error: finalization_error.clone(),
+                    thumbnail: thumbnail.clone(),
                     first_frame: first_frame.clone(),
                 };
                 let settings = Settings::new(
@@ -991,10 +1011,12 @@ pub fn start_recording(
     let finalization_error = Arc::clone(&final_err_for_worker);
     let gdi_encoder = shared_encoder.clone();
     let show_cursor = config.show_cursor;
+    let thumbnail_for_gdi = thumbnail;
 
     let worker = thread::Builder::new()
         .name("featherweight-gdi-worker".into())
         .spawn(move || {
+            let mut thumbnail_pending = thumbnail_for_gdi;
             let mut gdi_capture = match GdiCapture::new(
                 hmonitor,
                 width,
@@ -1024,6 +1046,12 @@ pub fn start_recording(
 
                 match gdi_capture.grab() {
                     Ok(buffer) => {
+                        // The first successful grab becomes the session's
+                        // thumbnail still; the DIB is bottom-up, which the
+                        // save helper accounts for.
+                        if let Some(path) = thumbnail_pending.take() {
+                            save_gdi_thumbnail(buffer, width, height, &path);
+                        }
                         let timestamp = (started_at.elapsed().as_nanos() / 100) as i64;
                         let mut enc_guard = gdi_encoder.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(enc) = enc_guard.as_mut() {
@@ -1128,6 +1156,198 @@ fn start_audio_pipeline(
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// First-frame thumbnail (Recording view still)
+// ---------------------------------------------------------------------------
+
+/// Longest-edge cap for the first-frame thumbnail: large enough to read a
+/// game's HUD, small enough to upload and draw cheaply.
+const THUMBNAIL_MAX_WIDTH: u32 = 960;
+const THUMBNAIL_MAX_HEIGHT: u32 = 540;
+
+/// Path of the still the Recording view shows while a session runs: the
+/// pipeline's first frame, downscaled and saved as a PNG. The directory
+/// follows the app log's pattern (`%LOCALAPPDATA%\Featherweight`); the file
+/// is overwritten by every session, so it always belongs to the latest one.
+///
+/// Returns `None` when the directory is unavailable (locked-down profiles);
+/// the session then records normally without a thumbnail.
+pub(crate) fn first_frame_png_path() -> Option<PathBuf> {
+    let dir = dirs::data_local_dir()?.join("Featherweight");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("first-frame.png"))
+}
+
+/// Deletes the previous session's first-frame still. Called when a session
+/// starts so the Recording view never shows a stale image from before.
+pub(crate) fn clear_first_frame_thumbnail() {
+    let Some(path) = first_frame_png_path() else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::log(&format!(
+            "could not clear the first-frame thumbnail {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Writes the first WGC frame as a downscaled PNG thumbnail. Failure is
+/// logged once and never fails the session.
+///
+/// Runs on the capture thread before `first_frame` is published, so the file
+/// is on disk by the time the recorder's `Started` event reaches the UI.
+fn save_wgc_thumbnail(frame: &mut Frame, path: &Path) {
+    let saved = || -> Option<()> {
+        let width = frame.width();
+        let height = frame.height();
+        let mut scratch = Vec::new();
+        let buffer = frame.buffer().ok()?;
+        let source = buffer.as_nopadding_buffer(&mut scratch);
+        let (rgba, out_w, out_h) = downscale_bgra_to_rgba(source, width, height, false);
+        write_png_file(path, &rgba, out_w, out_h, Some((width, height))).ok()
+    }();
+    match saved {
+        Some(()) => log::log(&format!(
+            "First-frame thumbnail written to {}",
+            path.display()
+        )),
+        None => log::log("First-frame thumbnail could not be written (non-fatal)"),
+    }
+}
+
+/// Writes the GDI fallback's first successful grab as a downscaled PNG
+/// thumbnail. The GDI DIB is bottom-up, which [`downscale_bgra_to_rgba`]
+/// accounts for via its `bottom_up` flag.
+fn save_gdi_thumbnail(buffer: &[u8], width: u32, height: u32, path: &Path) {
+    let (rgba, out_w, out_h) = downscale_bgra_to_rgba(buffer, width, height, true);
+    match write_png_file(path, &rgba, out_w, out_h, Some((width, height))) {
+        Ok(()) => log::log(&format!(
+            "First-frame thumbnail written to {}",
+            path.display()
+        )),
+        Err(e) => log::log(&format!(
+            "First-frame thumbnail could not be written (non-fatal): {e}"
+        )),
+    }
+}
+
+/// The downscaled thumbnail dimensions for a source size: fits within the
+/// 960x540 cap preserving aspect ratio, never upscaled.
+fn thumbnail_size(width: u32, height: u32) -> (u32, u32) {
+    let scale = 1.0_f64.min(
+        (THUMBNAIL_MAX_WIDTH as f64 / width.max(1) as f64)
+            .min(THUMBNAIL_MAX_HEIGHT as f64 / height.max(1) as f64),
+    );
+    (
+        ((width as f64 * scale).floor() as u32).max(1),
+        ((height as f64 * scale).floor() as u32).max(1),
+    )
+}
+
+/// Nearest-neighbour downscales a tightly packed BGRA buffer with
+/// [`thumbnail_size`]'s dimensions, swaps to RGBA, and returns the top-down
+/// result. A `bottom_up` source (GDI's DIB layout) has its rows mirrored
+/// first. Returns `(rgba, out_width, out_height)`.
+fn downscale_bgra_to_rgba(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    bottom_up: bool,
+) -> (Vec<u8>, u32, u32) {
+    let (out_w, out_h) = thumbnail_size(width, height);
+    let mut rgba = vec![0u8; out_w as usize * out_h as usize * 4];
+    for out_row in 0..out_h {
+        let top_down_row = (out_row as u64 * height as u64 / out_h as u64) as usize;
+        let src_row = if bottom_up {
+            // A bottom-up DIB stores the bottom scanline first.
+            (height as usize).saturating_sub(1 + top_down_row)
+        } else {
+            top_down_row
+        };
+        for out_col in 0..out_w {
+            let src_col = (out_col as u64 * width as u64 / out_w as u64) as usize;
+            let s = (src_row * width as usize + src_col) * 4;
+            let d = (out_row as usize * out_w as usize + out_col as usize) * 4;
+            rgba[d] = src[s + 2];
+            rgba[d + 1] = src[s + 1];
+            rgba[d + 2] = src[s];
+            rgba[d + 3] = src[s + 3];
+        }
+    }
+    (rgba, out_w, out_h)
+}
+
+/// tEXt keyword under which the thumbnail records the capture resolution it
+/// was downscaled from; the Recording view reads it back so its resolution
+/// readout states the video's true size, not the thumbnail's.
+const THUMBNAIL_SOURCE_KEYWORD: &str = "Source-Resolution";
+
+/// Encodes RGBA pixels as an 8-bit truecolor PNG and returns the bytes. When
+/// `source` is given, the capture resolution the still was downscaled from
+/// is recorded as a tEXt chunk (see [`THUMBNAIL_SOURCE_KEYWORD`]).
+fn encode_png_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    source: Option<(u32, u32)>,
+) -> Result<Vec<u8>, png::EncodingError> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    if let Some((src_w, src_h)) = source {
+        encoder.add_text_chunk(
+            THUMBNAIL_SOURCE_KEYWORD.to_owned(),
+            format!("{src_w}x{src_h}"),
+        )?;
+    }
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    writer.finish()?;
+    Ok(out)
+}
+
+/// Encodes RGBA pixels as a PNG and writes them to `path`. `source` is the
+/// full-resolution capture size the still was downscaled from.
+fn write_png_file(
+    path: &Path,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    source: Option<(u32, u32)>,
+) -> Result<(), String> {
+    let png_bytes = encode_png_rgba(rgba, width, height, source)
+        .map_err(|e| format!("png encode failed: {e}"))?;
+    std::fs::write(path, &png_bytes).map_err(|e| format!("write failed: {e}"))?;
+    Ok(())
+}
+
+/// Reads the capture resolution recorded in the thumbnail PNG's
+/// `Source-Resolution` tEXt chunk, e.g. `(1920, 1080)` — the true video size,
+/// which the downscaled image itself no longer shows. Returns `None` when the
+/// file does not exist or carries no chunk (a still from an older build).
+pub(crate) fn first_frame_source_resolution() -> Option<(u32, u32)> {
+    let path = first_frame_png_path()?;
+    let bytes = std::fs::read(path).ok()?;
+    source_resolution_from_png(&bytes)
+}
+
+/// Parses [`THUMBNAIL_SOURCE_KEYWORD`] out of a PNG byte stream.
+fn source_resolution_from_png(bytes: &[u8]) -> Option<(u32, u32)> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let reader = decoder.read_info().ok()?;
+    let chunk = reader
+        .info()
+        .uncompressed_latin1_text
+        .iter()
+        .find(|chunk| chunk.keyword == THUMBNAIL_SOURCE_KEYWORD)?;
+    let (width, height) = chunk.text.split_once('x')?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,5 +1473,69 @@ mod tests {
             assert_eq!(px(1, y), &[255, 0, 0, 255]);
             assert_eq!(px(2, y), &[255, 0, 0, 255]);
         }
+    }
+
+    #[test]
+    fn thumbnail_size_caps_to_960x540() {
+        assert_eq!(thumbnail_size(1920, 1080), (960, 540));
+        assert_eq!(thumbnail_size(3840, 2160), (960, 540));
+        // A taller source is capped by height and keeps its aspect ratio.
+        assert_eq!(thumbnail_size(800, 600), (720, 540));
+        // Smaller sources are never upscaled.
+        assert_eq!(thumbnail_size(100, 50), (100, 50));
+    }
+
+    #[test]
+    fn thumbnail_downscale_swaps_bgra_to_rgba() {
+        // 2x2 source under the cap passes through 1:1 with channels swapped.
+        let src: Vec<u8> = [
+            10, 20, 30, 255, // (0,0): B=10 G=20 R=30
+            40, 50, 60, 255, // (1,0)
+            70, 80, 90, 255, // (0,1)
+            100, 110, 120, 255, // (1,1)
+        ]
+        .to_vec();
+        let (rgba, w, h) = downscale_bgra_to_rgba(&src, 2, 2, false);
+        assert_eq!((w, h), (2, 2));
+        let px = |x: usize, y: usize| &rgba[(y * 2 + x) * 4..(y * 2 + x) * 4 + 4];
+        assert_eq!(px(0, 0), &[30, 20, 10, 255]);
+        assert_eq!(px(1, 0), &[60, 50, 40, 255]);
+        assert_eq!(px(0, 1), &[90, 80, 70, 255]);
+        assert_eq!(px(1, 1), &[120, 110, 100, 255]);
+    }
+
+    #[test]
+    fn thumbnail_downscale_unflips_bottom_up_sources() {
+        // A 1x2 bottom-up DIB stores the bottom scanline first; the RGBA
+        // result must come out top-down.
+        let src: Vec<u8> = [1, 2, 3, 4, 5, 6, 7, 8].to_vec();
+        let (rgba, w, h) = downscale_bgra_to_rgba(&src, 1, 2, true);
+        assert_eq!((w, h), (1, 2));
+        // Visual top row = the buffer's last row: B=5 G=6 R=7 A=8.
+        assert_eq!(&rgba[0..4], &[7, 6, 5, 8]);
+        assert_eq!(&rgba[4..8], &[3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn png_roundtrip_preserves_rgba() {
+        let width = 3u32;
+        let height = 2u32;
+        let rgba: Vec<u8> = (0..width * height)
+            .flat_map(|i| [(i * 7) as u8, (i * 13) as u8, (i * 29) as u8, 255])
+            .collect();
+        let png = encode_png_rgba(&rgba, width, height, None).expect("encode");
+        let (decoded, w, h) = crate::app::theme::decode_png_rgba(&png).expect("decode");
+        assert_eq!((w, h), (width, height));
+        assert_eq!(decoded, rgba);
+    }
+
+    #[test]
+    fn png_records_and_reads_back_source_resolution() {
+        let rgba = vec![0u8; 4]; // 1x1 opaque black
+        let png = encode_png_rgba(&rgba, 1, 1, Some((1920, 1080))).expect("encode");
+        assert_eq!(source_resolution_from_png(&png), Some((1920, 1080)));
+        // No chunk recorded → nothing to read back.
+        let plain = encode_png_rgba(&rgba, 1, 1, None).expect("encode");
+        assert_eq!(source_resolution_from_png(&plain), None);
     }
 }

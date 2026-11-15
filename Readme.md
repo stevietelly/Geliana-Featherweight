@@ -1,10 +1,10 @@
-# Featherweight
+# Geliana Featherweight
 
 A screen recorder built for PCs that can barely run the game, let alone record it.
 
-Featherweight is a Rust screen recorder with one job: capture gameplay while taking as little CPU, GPU and RAM from the game as possible. If your machine struggles to hit 60 FPS on its own, the recorder should not be the reason it hits 40.
+Geliana Featherweight is a Rust screen recorder with one job: capture gameplay while taking as little CPU, GPU and RAM from the game as possible. If your machine struggles to hit 60 FPS on its own, the recorder should not be the reason it hits 40.
 
-> **Status: early prototype.** Capture and encode work end to end on Windows. Everything under [Roadmap](#roadmap) is intent, not shipped behavior.
+> **Status: usable, still young (v0.2.1).** Capture, audio and encoding work end to end on Windows, with a real UI, tray app and installer. Overhead is engineered for, but published benchmark numbers against OBS are still pending — see [Roadmap](#roadmap).
 
 ---
 
@@ -39,66 +39,89 @@ Featherweight treats overhead as the primary feature. Every design decision is j
 
 ---
 
-## Current state
+## What it does today
 
-The prototype is a single binary built on the [`windows-capture`](https://crates.io/crates/windows-capture) crate (Windows Graphics Capture API):
+- **Windows Graphics Capture** for monitors *and* application windows, with an automatic GDI fallback for monitor capture on systems where WGC misbehaves (toggle: `force_gdi`)
+- **H.264 MP4 output** through Media Foundation's hardware encoder (via the [`windows-capture`](https://crates.io/crates/windows-capture) crate), sized from the target's real resolution on the first frame
+- **Configurable capture**: FPS, bitrate, cursor visibility, optional recording-length limit — the output resolution follows the capture target itself
+- **Audio**: WASAPI loopback for system sound and microphone capture, per-source volume, a mic gate threshold, and microphone noise suppression (RNNoise) that can be disabled or tuned by strength
+- **Optional separate audio tracks**: mix system + mic into one track, or keep two tracks in the file for post-mixing
+- **A real UI** (egui): a Recording tab with a live monitor — the first captured frame as a still, elapsed time, output size and rate, RAM use, and disk headroom with a time-left estimate — plus a past-recordings list that flexes into the space below
+- **Settings tab**: capture target (monitor or open window), audio sources and levels, output folder and filename template, disk behavior, hotkeys, and more — persisted to disk and applied live
+- **System tray app**: start/stop, open the recordings folder, quick preference toggles; closing the window hides to the tray instead of quitting, and the tray label mirrors session state
+- **Global hotkeys**: start/stop recording from anywhere (default `Ctrl+F9` / `Ctrl+F10`), rebindable in the UI
+- **Disk safety**: warns while space is running low and force-stops the session before the drive hits the floor, using the *measured* output rate to tell you how much recording time is left
+- **Crash and session tolerance**: output is staged as `<name>.temp.mp4` and swapped into place on finalize; a session-end watcher finalizes a running recording on Windows shutdown/logoff; stop reasons are recorded so an automatic stop (hidden window, session end, disk floor) is explained afterwards
+- **Single-instance**: launching twice surfaces the running window instead of starting a second recorder
+- **Past-recordings list**: finished captures in the output folder, newest first, with date and size, open-file and open-folder shortcuts
+- **Filename templates** with `{d}`, `{t}`, `{ms}`, `{monitor}` and friends, sanitized against path escapes and Windows reserved names
+- **First-run hints and honest warnings**: which dialog failed, why the still is missing, what stopped the recording — surfaced in the window, not swallowed into a log
+- **An About view** with the full license text of every dependency, embedded in the binary
 
-- Opens the system picker to choose a window or monitor
-- Captures frames via Windows Graphics Capture
-- Encodes through the crate's built-in video encoder to `video.mp4`
-- Records for a fixed 6 seconds, then finalizes and exits
-- No audio, no UI, no configuration
+## Install
 
-This is a spike to validate the capture path and see how the encoder behaves. It is not yet tuned for low-end hardware.
+Grab the latest release from the [releases page](https://github.com/stevietelly/Geliana-Featherweight/releases):
 
-### Build and run
+- **MSI installer** — installs to `Program Files\Geliana Featherweight` with Start Menu (and optional desktop) shortcuts, plus an optional system-PATH entry so `Featherweight` works from a terminal.
+- **Portable zip** — run `Geliana Featherweight.exe` directly, no installer needed.
 
-Requirements: Windows 10 (1903+) or Windows 11, a recent stable Rust toolchain.
+Requirements: Windows 10 (1903+) or Windows 11.
+
+### Build from source
 
 ```bash
 cargo run --release
 ```
 
-Pick a window or monitor in the dialog. After 6 seconds, `video.mp4` is written to the working directory.
+A recent stable Rust toolchain is required. The binary is a GUI app — no console window.
 
----
+## Basic use
+
+1. Featherweight starts in the tray. Open the window from the tray icon (or just launch it again).
+2. On the Recording tab, pick a monitor or window on the Settings tab — or keep the default monitor.
+3. Hit **Record** (or `Ctrl+F9` anywhere), stop with **Stop** (`Ctrl+F10`), find finished files in `Videos\Featherweight` by default.
+4. The Recording tab shows the first captured frame while recording; when idle it lists your past recordings below.
+
+Most settings apply immediately and persist; advanced ones (performance preset, force-GDI, audio timestamps) live in `settings.json`.
 
 ## Roadmap
 
 Phases are ordered by what de-risks the project fastest. Each phase should be benchmarked before moving to the next.
 
-### Phase 0: Prove the capture path (current)
+### Phase 0: Prove the capture path (done, minus the numbers)
 - [x] Windows Graphics Capture via `windows-capture`
 - [x] Encode to MP4
-- [ ] Baseline measurements: CPU %, GPU %, RAM, dropped frames, and in-game FPS delta on a low-end machine
+- [x] Real UI, tray, hotkeys, configuration (originally planned for later phases)
+- [ ] **Baseline measurements**: CPU %, GPU %, RAM, dropped frames, and in-game FPS delta on a low-end machine
 - [ ] Compare against OBS (same game, same settings) to set a real target
 
-### Phase 1: Headless core
+### Phase 1: Hardened core
 - [ ] Split into a `featherweight-core` library crate with no UI dependencies
-- [ ] Start/stop controlled by API, not by a timer
-- [ ] Configurable resolution, framerate, bitrate
+- [x] Start/stop controlled by API (UI, tray, hotkey), not by a timer
+- [x] Configurable framerate, bitrate, target, audio sources
 - [ ] Confirm the hardware encoder path (NVENC / AMF / Quick Sync via Media Foundation) is actually in use and that frames avoid CPU copies
 - [ ] Fragmented MP4 (or MKV) output so interrupted recordings stay playable
 - [ ] Graceful handling of capture-item loss (window closed, display change, GPU reset)
 
-### Phase 2: Audio
-- [ ] System audio via WASAPI loopback
-- [ ] Microphone input
-- [ ] Single shared clock (QPC-based) for audio and video, timestamped at capture time
-- [ ] Separate audio tracks so game and mic can be mixed later
+### Phase 2: Audio (shipped, needs polish)
+- [x] System audio via WASAPI loopback
+- [x] Microphone input with volume, gate threshold, and RNNoise suppression
+- [x] Shared QPC-based clock, timestamped at capture time
+- [x] Optional separate audio tracks for post-mixing
+- [ ] End-to-end A/V sync verification on the recorders people actually use
 
 ### Phase 3: Low-end hardware support
-- [ ] First-run hardware detection (GPU vendor, encoder availability, iGPU/dGPU layout)
-- [ ] Presets, e.g. *Low impact* (720p30), *Balanced* (1080p30), *Quality* (1080p60)
-- [ ] Software encoder fallback (x264 ultrafast, capped threads) for GPUs with no hardware encoder, with a clear warning in the UI
+- [ ] First-run hardware detection (GPU vendor, encoder availability, iGPU/dGPU layout) surfaced in the UI
+- [x] Performance presets (Balanced default; Low impact via `settings.json`)
+- [ ] Software encoder fallback for GPUs with no hardware encoder, with a clear warning in the UI
 - [ ] Hybrid laptop handling: capture and encode on the correct adapter to avoid black frames and cross-GPU copies
 - [ ] Adaptive quality: step resolution or framerate down automatically if frames start dropping
 
-### Phase 4: Shell and controls
-- [ ] System tray app with global hotkeys (start/stop, save replay)
-- [ ] Tiny settings window; nothing rendered while a game is running
-- [ ] Recording stats: dropped frames, encode time, overhead estimate
-- [ ] Output folder management and basic file naming
+### Phase 4: Shell and controls (shipped)
+- [x] System tray app with global hotkeys (start/stop)
+- [x] Settings window; the window can be hidden entirely while recording
+- [x] Recording stats: output size, rate, RAM, disk ETA
+- [x] Output folder management and file naming
 
 ### Phase 5: Instant replay
 - [ ] Ring buffer holding the last *N* seconds of encoded video
@@ -113,19 +136,17 @@ Phases are ordered by what de-risks the project fastest. Each phase should be be
 - Per-game profiles and auto-start on game launch
 - Optional gpui front end, if its memory cost can be justified
 
----
-
 ## Design principles
 
-**The recorder core is headless.** Capture, encode and mux live in a library with no UI dependency. Any front end (tray, settings window, CLI) is a thin client. The UI can be closed entirely while recording.
+**The recorder core is headless.** Capture, encode and mux live in pipeline code with no UI dependency — the UI hands it a config and receives events over a channel. The UI can be closed entirely while recording.
 
 **GPU in, GPU through, file out.** The target pipeline is: capture texture → hardware encoder → muxer. CPU involvement should be limited to scheduling and muxing.
 
-**Bounded everything.** Queues, buffers and the replay ring all have fixed upper bounds. If the encoder falls behind, drop frames deliberately and report it rather than ballooning memory.
+**Bounded everything.** Queues and buffers have fixed upper bounds. If the encoder falls behind, drop frames deliberately and report it rather than ballooning memory.
 
 **Measure, don't assume.** Claims about low overhead get backed by benchmarks on real low-end hardware, published in this repo.
 
-**Fail safe.** Output is written incrementally. Errors are surfaced, not swallowed.
+**Fail safe.** Output is written incrementally to a staging file. Errors are surfaced in the UI, not swallowed.
 
 ## Target hardware
 
@@ -142,7 +163,7 @@ Development benchmarks should run on hardware in this class, not only on a moder
 
 | Platform | Status |
 |---|---|
-| Windows 10 (1903+) / 11 | Prototype working |
+| Windows 10 (1903+) / 11 | Working (WGC + GDI fallback, WASAPI audio, Media Foundation encode) |
 | Linux | Not started |
 | macOS | Not started |
 
@@ -162,9 +183,12 @@ Open an issue before starting large changes so the design stays coherent.
 
 ## License
 
-To be decided.
+MIT — see [LICENSE](LICENSE). Third-party license texts are embedded in the app's About view.
 
 ## Acknowledgements
 
 - [`windows-capture`](https://crates.io/crates/windows-capture) for the capture and encoding foundation
 - The Rust `windows` crate ecosystem
+- [`wasapi`](https://crates.io/crates/wasapi) for system-audio loopback and microphone capture
+- [`nnnoiseless`](https://crates.io/crates/nnnoiseless) (RNNoise) and the vendored SpeexDSP for microphone noise suppression
+- [`egui`/`eframe`](https://github.com/emilk/egui) for the immediate-mode UI, and [`tray-icon`](https://crates.io/crates/tray-icon) for the system tray

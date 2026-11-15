@@ -18,6 +18,7 @@ pub(crate) const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
 pub(crate) const MUTED: Color32 = Color32::from_rgb(130, 138, 155);
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(10, 115, 235);
 pub(crate) const RED: Color32 = Color32::from_rgb(220, 48, 56);
+pub(crate) const WHITE: Color32 = Color32::from_rgb(255, 255, 255);
 pub(crate) const AMBER: Color32 = Color32::from_rgb(220, 165, 0);
 pub(crate) const GREEN: Color32 = Color32::from_rgb(48, 210, 111);
 pub(crate) const METER_BG: Color32 = Color32::from_rgb(20, 24, 30);

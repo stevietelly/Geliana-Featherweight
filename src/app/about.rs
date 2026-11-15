@@ -85,7 +85,7 @@ impl AboutView {
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new("Featherweight")
+                        RichText::new("Geliana Featherweight")
                             .size(22.0)
                             .strong()
                             .color(TEXT),
@@ -131,7 +131,7 @@ fn licenses_card(ui: &mut egui::Ui) {
         section_title(ui, "Third-party licenses");
         ui.label(
             RichText::new(
-                "Featherweight is MIT-licensed and is built on open source. \
+                "Geliana Featherweight is MIT-licensed and is built on open source. \
                  Each group lists the covered crates; expanding it shows the \
                  full license text.",
             )

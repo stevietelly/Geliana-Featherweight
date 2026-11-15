@@ -60,7 +60,7 @@
 
     <Product
         Id='*'
-        Name='GelianaFeatherweight'
+        Name='Geliana Featherweight'
         UpgradeCode='4721429C-FCE3-40BF-B553-7E8B1FFE0F19'
         Manufacturer='Stephen Telian; Geliana'
         Language='1033'
@@ -83,11 +83,11 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='GelianaFeatherweight Installation'/>
+        <Property Id='DiskPrompt' Value='Geliana Featherweight Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='GelianaFeatherweight'>
+                <Directory Id='APPLICATIONFOLDER' Name='Geliana Featherweight'>
                     <!--
                       Disabling the license sidecar file in the installer is a two step process:
 
@@ -116,13 +116,69 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='GelianaFeatherweight.exe'
+                                Name='Geliana Featherweight.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\GelianaFeatherweight.exe'
+                                Source='$(var.CargoTargetBinDir)\Featherweight.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
                 </Directory>
+            </Directory>
+
+            <!--
+              Start Menu shortcut, always installed. The folder is removed on
+              uninstall. Per-machine scope (see the Package element) puts it
+              in the all-users Start Menu.
+            -->
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationMenuFolder' Name='Geliana Featherweight'>
+                    <Component Id='StartMenuShortcut' Guid='*'>
+                        <Shortcut
+                            Id='StartMenuShortcutFile'
+                            Name='Geliana Featherweight'
+                            Description='A resource-efficient screen recorder that runs in the background while you game.'
+                            Target='[Bin]Geliana Featherweight.exe'
+                            WorkingDirectory='Bin'/>
+                        <RemoveFolder
+                            Id='RemoveApplicationMenuFolder'
+                            On='uninstall'/>
+                        <!--
+                          A non-advertised shortcut needs a KeyPath in its own
+                          component. HKMU resolves to HKLM for this
+                          per-machine install, matching its scope.
+                        -->
+                        <RegistryValue
+                            Root='HKMU'
+                            Key='Software\[Manufacturer]\[ProductName]'
+                            Name='StartMenuShortcut'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <!--
+              Desktop shortcut, exposed as an optional sub-feature (like the
+              PATH one) so users can skip it in the feature tree. HKMU again
+              keeps the KeyPath machine-wide.
+            -->
+            <Directory Id='DesktopFolder'>
+                <Component Id='DesktopShortcut' Guid='*'>
+                    <Shortcut
+                        Id='DesktopShortcutFile'
+                        Name='Geliana Featherweight'
+                        Description='A resource-efficient screen recorder that runs in the background while you game.'
+                        Target='[Bin]Geliana Featherweight.exe'
+                        WorkingDirectory='Bin'/>
+                    <RegistryValue
+                        Root='HKMU'
+                        Key='Software\[Manufacturer]\[ProductName]'
+                        Name='DesktopShortcut'
+                        Type='integer'
+                        Value='1'
+                        KeyPath='yes'/>
+                </Component>
             </Directory>
         </Directory>
 
@@ -143,6 +199,9 @@
             
             <ComponentRef Id='binary0'/>
 
+            <!-- Start Menu shortcut is always installed. -->
+            <ComponentRef Id='StartMenuShortcut'/>
+
             <Feature
                 Id='Environment'
                 Title='PATH Environment Variable'
@@ -150,6 +209,15 @@
                 Level='1'
                 Absent='allow'>
                 <ComponentRef Id='Path'/>
+            </Feature>
+
+            <Feature
+                Id='DesktopShortcutFeature'
+                Title='Desktop Shortcut'
+                Description='Add a shortcut to the [ProductName] executable on the desktop.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='DesktopShortcut'/>
             </Feature>
         </Feature>
 

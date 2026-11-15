@@ -51,9 +51,9 @@ pub const ID_MUTE_MIC: &str = "mute_mic";
 pub const ID_QUIT: &str = "quit";
 
 /// Toggle label while the window is hidden.
-pub const LABEL_OPEN: &str = "Open Featherweight";
+pub const LABEL_OPEN: &str = "Open Geliana Featherweight";
 /// Toggle label while the window is visible.
-pub const LABEL_HIDE: &str = "Hide Featherweight";
+pub const LABEL_HIDE: &str = "Hide Geliana Featherweight";
 
 /// Loudly flag a feature that is wired into the UI but not implemented yet.
 /// Prints to the console and writes to the log file.
@@ -89,7 +89,7 @@ impl TrayMenu {
         separate_audio_tracks_enabled: bool,
         force_gdi_enabled: bool,
     ) -> Result<(Menu, Self), Box<dyn Error + Send + Sync>> {
-        let status_item = MenuItem::with_id(ID_STATUS, "Featherweight - idle", false, None);
+        let status_item = MenuItem::with_id(ID_STATUS, "Geliana Featherweight - idle", false, None);
         // Initial label reflects the app's default hidden-at-start state.
         let toggle_item = MenuItem::with_id(ID_TOGGLE, LABEL_OPEN, true, None);
         let stop_item = MenuItem::with_id(ID_STOP, "Stop recording", recording, None);
@@ -237,4 +237,20 @@ pub(crate) fn open_folder(dir: &Path) -> Result<(), String> {
     spawned
         .map(|_| ())
         .map_err(|e| format!("could not launch file manager: {e}"))
+}
+
+/// Opens a file with its default associated application.
+///
+/// Used by the Recording view's past-recordings list to play a finished
+/// capture. Windows hands the path to Explorer, which launches the default
+/// handler; other platforms use xdg-open.
+pub(crate) fn open_file(file: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let spawned = std::process::Command::new("explorer").arg(file).spawn();
+    #[cfg(not(windows))]
+    let spawned = std::process::Command::new("xdg-open").arg(file).spawn();
+
+    spawned
+        .map(|_| ())
+        .map_err(|e| format!("could not open recording: {e}"))
 }

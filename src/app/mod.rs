@@ -10,6 +10,7 @@ use crate::config::AppConfig;
 use crate::log;
 
 pub mod about;
+pub mod recordings;
 pub mod session;
 pub mod theme;
 pub mod widgets;
@@ -23,11 +24,11 @@ pub mod shutdown;
 #[cfg(windows)]
 pub mod single_instance;
 
-const APP_NAME: &str = "Featherweight";
+const APP_NAME: &str = "Geliana Featherweight";
 
 pub fn run() -> eframe::Result {
     log::log_init();
-    log::log("Initializing Featherweight");
+    log::log(&format!("Initializing {APP_NAME}"));
 
     // Single-instance protection: when an instance is already running, a
     // second launch must not start — it surfaces the running instance's
@@ -37,7 +38,7 @@ pub fn run() -> eframe::Result {
     match single_instance::acquire() {
         single_instance::Acquisition::Acquired => {}
         single_instance::Acquisition::AlreadyRunning => {
-            log::log("another Featherweight instance is running; surfacing it and exiting");
+            log::log(&format!("another {APP_NAME} instance is running; surfacing it and exiting"));
             single_instance::signal_previous();
             return Ok(());
         }
@@ -105,9 +106,9 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
     }
 
     let hint = first_run.then(|| {
-        "Featherweight runs in the notification area. Click ^ next to the clock, then drag the \
-         feather icon onto the taskbar to pin it. (Start hidden can be turned off in this window.)"
-            .to_owned()
+        format!("{APP_NAME} runs in the notification area. Click ^ next to the clock, then drag \
+                 the feather icon onto the taskbar to pin it. (Start hidden can be turned off in \
+                 this window.)")
     });
 
     log::log(&format!(
@@ -247,7 +248,7 @@ fn try_run(use_wgpu: bool) -> eframe::Result {
         &event_loop,
     );
 
-    log::log("Starting Featherweight event loop");
+    log::log(&format!("Starting {APP_NAME} event loop"));
 
     let run_result = event_loop.run_app(&mut app);
 

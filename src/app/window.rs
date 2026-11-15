@@ -17,7 +17,7 @@ use eframe::egui::{
 use crate::{
     app::{
         session::{SessionShared, SessionStats, StopReason},
-        theme::{AMBER, BG, BORDER, MUTED, RED, TEXT},
+        theme::{AMBER, BG, BORDER, MUTED, RED, TEXT, WHITE},
         widgets::{
             self, CONTROL_HEIGHT, VALUE_WIDTH,
             integer_slider, row, section_title, settings_card, stat_chip,
@@ -152,9 +152,26 @@ pub struct FeatherweightApp {
     /// Capture resolution recorded inside the thumbnail PNG; the true video
     /// size, which the downscaled still itself no longer shows.
     thumb_resolution: Option<(u32, u32)>,
+    /// Past recordings in the output folder, newest first, listed below the
+    /// live monitor on the Recording view.
+    recordings: Vec<crate::app::recordings::RecordingEntry>,
+    /// Directory `recordings` was scanned from; a Settings change to the
+    /// output directory is detected as a mismatch and triggers a rescan.
+    recordings_dir: PathBuf,
+    /// Set when the list should be rescanned on the next Recording-view
+    /// frame: after a session ends, on entering the view, or via Refresh.
+    recordings_stale: bool,
+    /// Instant of the last directory scan. While idle the view rescans at
+    /// most every few seconds, because a finished file appears only after
+    /// the mux swaps the staging file in.
+    last_recordings_scan: std::time::Instant,
     /// About view state (the app icon texture).
     about: crate::app::about::AboutView,
 }
+
+/// Share of the remaining window height the list keeps for itself; the
+/// still above gets the rest, so both flex with the viewport.
+const HISTORY_SHARE: f32 = 0.6;
 
 impl FeatherweightApp {
     /// `start_visible` is false when the app is configured to start in the
@@ -200,6 +217,10 @@ impl FeatherweightApp {
         // whichever way the window started.
         tray.set_window_visible(start_visible);
 
+        // First scan of the output folder for the past-recordings list.
+        let recordings = crate::app::recordings::scan_recordings(&config.output_dir);
+        let recordings_dir = config.output_dir.clone();
+
         Self {
             tray,
             shared,
@@ -223,6 +244,10 @@ impl FeatherweightApp {
             thumb: None,
             thumb_for: None,
             thumb_resolution: None,
+            recordings,
+            recordings_dir,
+            recordings_stale: false,
+            last_recordings_scan: std::time::Instant::now(),
             about: crate::app::about::AboutView::new(),
         }
     }
@@ -424,7 +449,7 @@ impl FeatherweightApp {
         // ---------------------------------------------------------------------------
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("Featherweight")
+                RichText::new("Geliana Featherweight")
                     .size(22.0)
                     .strong()
                     .color(TEXT),
@@ -494,10 +519,12 @@ impl FeatherweightApp {
                     }
                 });
                 ui.add_space(8.0);
-                // Placeholder until the target's first frame lands.
+                // Placeholder until the target's first frame lands; sized to
+                // leave room for the past-recordings list below.
                 draw_still(
                     ui,
                     None,
+                    (ui.available_height() - self.history_reserve(ui)).max(90.0),
                     &format!("Waiting for {target}…"),
                     "The still appears once the target delivers its first frame — a \
                      minimized window delivers none until restored.",
@@ -662,6 +689,153 @@ impl FeatherweightApp {
             }
             ui.add_space(6.0);
         }
+
+        // Past recordings: everything finished in the output folder, listed
+        // below the live monitor / idle card.
+        self.render_recordings_history(ui, recording);
+    }
+
+    /// Re-scans the output folder for the past-recordings list.
+    fn refresh_recordings(&mut self) {
+        self.recordings = crate::app::recordings::scan_recordings(&self.config.output_dir);
+        self.recordings_dir = self.config.output_dir.clone();
+        self.recordings_stale = false;
+        self.last_recordings_scan = std::time::Instant::now();
+    }
+
+    /// Vertical space the past-recordings section below needs; the still
+    /// above shrinks to leave this room. When the list has entries it
+    /// flexes to a fixed share of the remaining height, so both it and the
+    /// still scale with the window; an empty list only needs its header
+    /// and empty-state line.
+    fn history_reserve(&self, ui: &egui::Ui) -> f32 {
+        if self.recordings.is_empty() {
+            48.0
+        } else {
+            // The 120 floor keeps the list readable on short windows, but it
+            // can never claim more than actually remains — clamping to a
+            // `min` above the remaining height would panic.
+            let remaining = ui.available_height();
+            (remaining * HISTORY_SHARE).max(120.0).min(remaining)
+        }
+    }
+
+    /// Past recordings: every finished capture in the output folder, newest
+    /// first, listed below the live monitor. Each row opens the file with
+    /// its default player; the header opens the folder.
+    ///
+    /// Rescan policy: the list changes outside this window (session stops,
+    /// the mux finalising a moment later, edits in Explorer), so it refreshes
+    /// on view entry, when a session ends, when the output folder changes in
+    /// Settings, on the Refresh button, and — while idle — at most every few
+    /// seconds. While a session records there is nothing new to find (only
+    /// staging files exist), so the periodic rescan is skipped.
+    fn render_recordings_history(&mut self, ui: &mut egui::Ui, recording: bool) {
+        let now = std::time::Instant::now();
+        let dir_changed = self.recordings_dir != self.config.output_dir;
+        let due = !recording
+            && now.duration_since(self.last_recordings_scan)
+                >= std::time::Duration::from_secs(5);
+        if dir_changed || self.recordings_stale || due {
+            self.refresh_recordings();
+        }
+
+        ui.add_space(10.0);
+        let dir = self.config.output_dir.to_string_lossy().to_string();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Past recordings")
+                    .size(14.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new(format!("· {} finished", self.recordings.len()))
+                    .size(12.0)
+                    .color(MUTED),
+            )
+            .on_hover_text(&dir);
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_sized([90.0, CONTROL_HEIGHT], Button::new("Refresh"))
+                    .clicked()
+                {
+                    self.refresh_recordings();
+                }
+                if ui
+                    .add_sized([110.0, CONTROL_HEIGHT], Button::new("Open folder"))
+                    .clicked()
+                {
+                    if let Err(e) = crate::tray::menu::open_folder(&self.config.output_dir) {
+                        self.warning = Some(e);
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if self.recordings.is_empty() {
+            let empty_text = if recording {
+                "Finished recordings appear here.".to_owned()
+            } else {
+                format!("No recordings in {} yet.", widgets::ellipsis(&dir, 56))
+            };
+            ui.label(RichText::new(empty_text).size(11.5).color(MUTED));
+            return;
+        }
+
+        // The list flexes: it takes whatever height is left below the
+        // monitor/idle card (the still above keeps a capped share of the
+        // window), and rows scroll inside that region. `min_scrolled_height`
+        // keeps it usable when the window is squeezed short.
+        ScrollArea::vertical()
+            .id_salt("past-recordings")
+            .auto_shrink([false, false])
+            .min_scrolled_height(90.0)
+            .show(ui, |ui| {
+                // Cloned out so the closure can borrow `self` for the
+                // warning bar without a conflicting list borrow.
+                let recordings = self.recordings.clone();
+                for entry in recordings {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(24, 28, 34))
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            let meta = match entry.modified {
+                                Some(when) => format!(
+                                    "{} · {}",
+                                    chrono::DateTime::<chrono::Local>::from(when)
+                                        .format("%Y-%m-%d %H:%M"),
+                                    crate::disk::format_bytes(entry.size_bytes)
+                                ),
+                                None => crate::disk::format_bytes(entry.size_bytes),
+                            };
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(widgets::ellipsis(&entry.name, 56))
+                                        .size(12.5)
+                                        .strong()
+                                        .color(TEXT),
+                                )
+                                .on_hover_text(entry.path.display().to_string());
+                                ui.label(RichText::new(meta).size(11.0).color(MUTED));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add_sized([90.0, CONTROL_HEIGHT], Button::new("Open"))
+                                    .clicked()
+                                {
+                                    if let Err(e) = crate::tray::menu::open_file(&entry.path) {
+                                        self.warning = Some(e);
+                                    }
+                                }
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            });
     }
 
     /// The monitor card shown while a session records: the first captured
@@ -704,15 +878,18 @@ impl FeatherweightApp {
         };
 
         ui.horizontal(|ui| {
-            // Left: the still, sized to fit what is left of the window.
+            // Left: the still, sized to fit what is left of the window,
+            // minus the room the past-recordings list below needs.
             let left_w = (ui.available_width() * 0.45).clamp(180.0, 420.0);
+            let left_h = (ui.available_height() - self.history_reserve(ui)).max(140.0);
             ui.allocate_ui_with_layout(
-                Vec2::new(left_w, ui.available_height().max(140.0)),
+                Vec2::new(left_w, left_h),
                 egui::Layout::top_down(Align::Center),
                 |ui| {
                     draw_still(
                         ui,
                         thumb.as_ref(),
+                        left_h,
                         pending_title,
                         pending_detail,
                     );
@@ -727,7 +904,7 @@ impl FeatherweightApp {
                     .corner_radius(egui::CornerRadius::same(6))
                     .inner_margin(egui::Margin::symmetric(10, 6));
                 frame.show(ui, |ui| {
-                    ui.label(RichText::new("●").color(RED).size(14.0));
+                    ui.label(RichText::new("●").color(WHITE).size(14.0));
                     ui.label(
                         RichText::new(format!(
                             "Recording {}",
@@ -1405,12 +1582,14 @@ fn stats_readout(stats: &SessionStats) -> String {
     }
 }
 
-/// Draws the first-frame still fit into the available space preserving its
-/// aspect ratio, or a bordered placeholder explaining why there is nothing
-/// to show yet.
+/// Draws the first-frame still fit into `max_h` preserving its aspect
+/// ratio, or a bordered placeholder explaining why there is nothing to
+/// show yet. `max_h` is what the caller can spare — the past-recordings
+/// section below takes the rest of the window.
 fn draw_still(
     ui: &mut egui::Ui,
     thumb: Option<&egui::TextureHandle>,
+    max_h: f32,
     placeholder_title: &str,
     placeholder_detail: &str,
 ) {
@@ -1418,7 +1597,7 @@ fn draw_still(
         // Placeholder sized like a 16:9 still.
         let width = ui.available_width();
         let height = (width * 9.0 / 16.0)
-            .min((ui.available_height() - 4.0).max(90.0))
+            .min((max_h - 4.0).max(90.0))
             .max(90.0);
         egui::Frame::new()
             .fill(Color32::from_rgb(24, 28, 34))
@@ -1442,10 +1621,10 @@ fn draw_still(
     };
 
     // Fit within the available space, preserving the aspect ratio.
+    let max_h = (max_h - 4.0).max(90.0);
     let [tex_w, tex_h] = texture.size();
     let aspect = tex_w.max(1) as f32 / tex_h.max(1) as f32;
     let max_w = ui.available_width();
-    let max_h = (ui.available_height() - 4.0).max(90.0);
     let mut size = Vec2::new(max_w, max_w / aspect);
     if size.y > max_h {
         size = Vec2::new(max_h * aspect, max_h);
@@ -1567,6 +1746,12 @@ impl eframe::App for FeatherweightApp {
         if active && !self.was_active {
             self.view = View::Recording;
         }
+        if !active && self.was_active {
+            // A finished session becomes a file in the output folder once
+            // the mux finalises; mark the history for a rescan so the
+            // Recording view picks the new recording up.
+            self.recordings_stale = true;
+        }
         self.was_active = active;
 
         egui::Panel::top("tabs")
@@ -1591,7 +1776,7 @@ impl eframe::App for FeatherweightApp {
                                         crate::tray::format_duration(*elapsed_secs)
                                     ),
                                 )
-                                .color(RED),
+                                .color(WHITE),
                                 _ => {
                                     RichText::new(label).color(if selected { TEXT } else { MUTED })
                                 }
@@ -1604,6 +1789,10 @@ impl eframe::App for FeatherweightApp {
                             .clicked()
                         {
                             self.view = view;
+                            if view == View::Recording {
+                                // Rescan on entry so the list is current.
+                                self.recordings_stale = true;
+                            }
                         }
                     }
                 });

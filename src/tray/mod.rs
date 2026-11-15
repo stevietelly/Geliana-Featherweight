@@ -136,7 +136,7 @@ impl Tray {
         let icon = icon_for(IconState::Stopped)?;
 
         let tray_icon = TrayIconBuilder::new()
-            .with_tooltip("Featherweight")
+            .with_tooltip("Geliana Featherweight")
             .with_menu(Box::new(menu))
             .with_icon(icon)
             .build()?;
@@ -300,14 +300,14 @@ impl SessionView {
 /// the capture target has not delivered its first frame, truncated to 127
 /// characters (Windows tooltip cap).
 ///
-/// Example: "Featherweight - waiting for Game 🎮…"
+/// Example: "Geliana Featherweight - waiting for Game 🎮…"
 fn waiting_status(target: &str) -> String {
     let target = if target.is_empty() {
         "the selected window"
     } else {
         target
     };
-    format!("Featherweight - waiting for {target}…")
+    format!("Geliana Featherweight - waiting for {target}…")
         .chars()
         .take(127)
         .collect()
@@ -327,8 +327,8 @@ fn mic_state(mic_on: bool, mic_muted: bool) -> MicState {    if !mic_on {
 /// stop is otherwise invisible to a tray-only user who never reopens the window.
 fn idle_status(stop_reason: Option<&StopReason>) -> String {
     match stop_reason.filter(|reason| reason.is_notable()) {
-        Some(reason) => format!("Featherweight - idle · stopped: {}", reason.short_label()),
-        None => "Featherweight - idle".to_owned(),
+        Some(reason) => format!("Geliana Featherweight - idle · stopped: {}", reason.short_label()),
+        None => "Geliana Featherweight - idle".to_owned(),
     }
 }
 

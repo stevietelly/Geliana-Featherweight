@@ -87,21 +87,23 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/GelianaFeatherweight.exe dist/
+          # Cargo cannot produce a space in the exe name, so carry the full
+          # product name in the zip: rename the binary on the way in.
+          Copy-Item target/release/Featherweight.exe "dist/Geliana Featherweight.exe"
           Copy-Item LICENSE dist/
           Copy-Item Readme.md dist/
           Compress-Archive -Path dist/* `
-            -DestinationPath "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.zip"
+            -DestinationPath "Geliana Featherweight-${{ steps.tag.outputs.tag }}-x64.zip"
 
       # cargo-wix names the installer after the Cargo.toml version (e.g.
-      # GelianaFeatherweight-0.1.0-x64.msi); rename to the release tag so the
+      # Featherweight-0.1.0-x64.msi); rename to the release tag so the
       # zip and MSI asset names stay consistent even when the tag gains a
       # short-commit suffix.
       - name: Name the MSI after the release tag
         shell: pwsh
         run: |
-          Copy-Item target/wix/GelianaFeatherweight-*.msi `
-            "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.msi"
+          Copy-Item target/wix/Featherweight-*.msi `
+            "Geliana Featherweight-${{ steps.tag.outputs.tag }}-x64.msi"
 
       - name: Create the GitHub release
         env:
@@ -109,8 +111,8 @@ jobs:
         shell: pwsh
         run: |
           gh release create "${{ steps.tag.outputs.tag }}" `
-            "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.zip" `
-            "GelianaFeatherweight-${{ steps.tag.outputs.tag }}-x64.msi" `
+            "Geliana Featherweight-${{ steps.tag.outputs.tag }}-x64.zip" `
+            "Geliana Featherweight-${{ steps.tag.outputs.tag }}-x64.msi" `
             --target "${{ github.event.pull_request.merge_commit_sha }}" `
             --title "Featherweight ${{ steps.tag.outputs.tag }}" `
             --notes ("Binary for PR #" + "${{ github.event.pull_request.number }}" + ": " +

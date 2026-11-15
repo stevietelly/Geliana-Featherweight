@@ -143,14 +143,16 @@
                             Id='RemoveApplicationMenuFolder'
                             On='uninstall'/>
                         <!--
-                          A non-advertised shortcut needs a KeyPath in its own
-                          component. HKLM makes it unambiguously per-machine,
-                          matching the shortcut data: ICE57 rejects HKMU
-                          because its root can be either per-user or
-                          per-machine.
+                          A non-advertised shortcut in a user-profile location
+                          must have an HKCU registry KeyPath (ICE43; HKLM gets
+                          ICE38/ICE57 errors). The marker lives in the
+                          installing user's hive and is removed on uninstall;
+                          the shortcut itself still lands in the all-users
+                          Start Menu because ALLUSERS=1 redirects
+                          ProgramMenuFolder there.
                         -->
                         <RegistryValue
-                            Root='HKLM'
+                            Root='HKCU'
                             Key='Software\[Manufacturer]\[ProductName]'
                             Name='StartMenuShortcut'
                             Type='integer'
@@ -162,9 +164,9 @@
 
             <!--
               Desktop shortcut, exposed as an optional sub-feature (like the
-              PATH one) so users can skip it in the feature tree. HKLM keeps
-              the KeyPath unambiguously machine-wide, matching the shortcut
-              data under ALLUSERS=1 (see ICE57 above).
+              PATH one) so users can skip it in the feature tree. Same HKCU
+              KeyPath requirement as the Start Menu shortcut (ICE43), with
+              DesktopFolder redirected to the public desktop by ALLUSERS=1.
             -->
             <Directory Id='DesktopFolder'>
                 <Component Id='DesktopShortcut' Guid='*'>
@@ -175,7 +177,7 @@
                         Target='[Bin]Geliana Featherweight.exe'
                         WorkingDirectory='Bin'/>
                     <RegistryValue
-                        Root='HKLM'
+                        Root='HKCU'
                         Key='Software\[Manufacturer]\[ProductName]'
                         Name='DesktopShortcut'
                         Type='integer'

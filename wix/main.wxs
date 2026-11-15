@@ -144,11 +144,13 @@
                             On='uninstall'/>
                         <!--
                           A non-advertised shortcut needs a KeyPath in its own
-                          component. HKMU resolves to HKLM for this
-                          per-machine install, matching its scope.
+                          component. HKLM makes it unambiguously per-machine,
+                          matching the shortcut data: ICE57 rejects HKMU
+                          because its root can be either per-user or
+                          per-machine.
                         -->
                         <RegistryValue
-                            Root='HKMU'
+                            Root='HKLM'
                             Key='Software\[Manufacturer]\[ProductName]'
                             Name='StartMenuShortcut'
                             Type='integer'
@@ -160,8 +162,9 @@
 
             <!--
               Desktop shortcut, exposed as an optional sub-feature (like the
-              PATH one) so users can skip it in the feature tree. HKMU again
-              keeps the KeyPath machine-wide.
+              PATH one) so users can skip it in the feature tree. HKLM keeps
+              the KeyPath unambiguously machine-wide, matching the shortcut
+              data under ALLUSERS=1 (see ICE57 above).
             -->
             <Directory Id='DesktopFolder'>
                 <Component Id='DesktopShortcut' Guid='*'>
@@ -172,7 +175,7 @@
                         Target='[Bin]Geliana Featherweight.exe'
                         WorkingDirectory='Bin'/>
                     <RegistryValue
-                        Root='HKMU'
+                        Root='HKLM'
                         Key='Software\[Manufacturer]\[ProductName]'
                         Name='DesktopShortcut'
                         Type='integer'
